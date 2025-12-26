@@ -355,28 +355,7 @@ def bench_one_case(dtype, num_qheads: int, num_kvheads: int, head_size: int, seq
     # Note: naive_paged_attn should be called last because it modified "query"
     # clone query to avoid that
 
-    # Custom timing using cuda.Event (workaround for ROCTracer not capturing raw HIP kernels)
-    def run_custom_perftest(func, *args, num_iters=5, num_warmup=2, **kwargs):
-        # Warmup
-        for _ in range(num_warmup):
-            out = func(*args, **kwargs)
-        torch.cuda.synchronize()
-        
-        # Measure
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        
-        start.record()
-        for _ in range(num_iters):
-            out = func(*args, **kwargs)
-        end.record()
-        end.synchronize()
-        
-        avg_ms = start.elapsed_time(end) / num_iters
-        avg_us = avg_ms * 1000
-        return out, avg_us
-
-    custom_attn_output, custom_us = run_custom_perftest(
+    custom_attn_output, custom_us = run_perftest(
         custom_paged_attn,
         query.clone(),
         key_cache,
