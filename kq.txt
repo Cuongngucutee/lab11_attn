@@ -1,0 +1,519 @@
+
+V320
+==== Batch Size 1, Context Len 256 ====
+==== Case 0 ====
+[W1227 18:04:19.631238997 collection.cpp:1098] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[aiter] 
+Naive Attention: 297.37 us, 0.06 tflops, 0.00 TB/s
+Custom Attention: 179.32 us, 0.09 tflops, 0.00 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 1, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 945.73 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 530.79 us, 0.25 tflops, 0.00 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 2231.22 us, 0.06 tflops, 0.00 TB/s
+Custom Attention: 376.76 us, 0.36 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 7432.58 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 3244.43 us, 0.33 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 4485.85 us, 0.06 tflops, 0.00 TB/s
+Custom Attention: 647.72 us, 0.41 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 14988.41 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 6337.19 us, 0.34 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 8857.05 us, 0.06 tflops, 0.00 TB/s
+Custom Attention: 1276.52 us, 0.42 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 29967.90 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 12553.47 us, 0.34 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 1, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 263.65 us, 0.03 tflops, 0.00 TB/s
+Custom Attention: 126.48 us, 0.07 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 1, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 577.93 us, 0.12 tflops, 0.01 TB/s
+Custom Attention: 308.55 us, 0.22 tflops, 0.03 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 1954.78 us, 0.03 tflops, 0.00 TB/s
+Custom Attention: 273.92 us, 0.25 tflops, 0.03 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 4486.58 us, 0.12 tflops, 0.01 TB/s
+Custom Attention: 1743.83 us, 0.31 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 3844.93 us, 0.03 tflops, 0.00 TB/s
+Custom Attention: 488.40 us, 0.27 tflops, 0.03 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 8988.05 us, 0.12 tflops, 0.01 TB/s
+Custom Attention: 3354.47 us, 0.32 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 7653.57 us, 0.04 tflops, 0.00 TB/s
+Custom Attention: 892.52 us, 0.30 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 18008.29 us, 0.12 tflops, 0.01 TB/s
+Custom Attention: 6565.03 us, 0.33 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+
+V400:
+==== Batch Size 1, Context Len 256 ====
+==== Case 0 ====
+[W1227 18:11:05.344654594 collection.cpp:1098] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[aiter] 
+Naive Attention: 307.53 us, 0.05 tflops, 0.00 TB/s
+Custom Attention: 179.96 us, 0.09 tflops, 0.00 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 1, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 953.53 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 529.55 us, 0.25 tflops, 0.00 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 2289.82 us, 0.06 tflops, 0.00 TB/s
+Custom Attention: 377.72 us, 0.36 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 7498.91 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 3262.72 us, 0.33 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 4554.85 us, 0.06 tflops, 0.00 TB/s
+Custom Attention: 647.76 us, 0.41 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 15118.11 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 6396.32 us, 0.34 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 9033.23 us, 0.06 tflops, 0.00 TB/s
+Custom Attention: 1272.36 us, 0.42 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 30300.93 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 12755.09 us, 0.34 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 1, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 273.21 us, 0.03 tflops, 0.00 TB/s
+Custom Attention: 126.88 us, 0.07 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 1, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 589.05 us, 0.11 tflops, 0.01 TB/s
+Custom Attention: 305.03 us, 0.22 tflops, 0.03 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 2019.78 us, 0.03 tflops, 0.00 TB/s
+Custom Attention: 273.72 us, 0.25 tflops, 0.03 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 4551.19 us, 0.12 tflops, 0.01 TB/s
+Custom Attention: 1748.80 us, 0.31 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 3997.53 us, 0.03 tflops, 0.00 TB/s
+Custom Attention: 488.72 us, 0.27 tflops, 0.03 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 9136.30 us, 0.12 tflops, 0.01 TB/s
+Custom Attention: 3382.08 us, 0.32 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 7921.66 us, 0.03 tflops, 0.00 TB/s
+Custom Attention: 890.04 us, 0.30 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 18286.48 us, 0.12 tflops, 0.01 TB/s
+Custom Attention: 6675.72 us, 0.32 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+
+V500:
+==== Batch Size 1, Context Len 256 ====
+==== Case 0 ====
+[W1227 18:19:49.909378962 collection.cpp:1098] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[aiter] 
+Naive Attention: 308.57 us, 0.05 tflops, 0.00 TB/s
+Custom Attention: 175.32 us, 0.10 tflops, 0.00 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 1, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 953.85 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 533.68 us, 0.25 tflops, 0.00 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 2304.55 us, 0.06 tflops, 0.00 TB/s
+Custom Attention: 317.60 us, 0.42 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 7502.85 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 3251.16 us, 0.33 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 4622.38 us, 0.06 tflops, 0.00 TB/s
+Custom Attention: 563.16 us, 0.48 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 15133.13 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 6363.09 us, 0.34 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 9184.56 us, 0.06 tflops, 0.00 TB/s
+Custom Attention: 1069.72 us, 0.50 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 30292.55 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 12729.75 us, 0.34 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 1, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 277.41 us, 0.03 tflops, 0.00 TB/s
+Custom Attention: 124.24 us, 0.07 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 1, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 590.25 us, 0.11 tflops, 0.01 TB/s
+Custom Attention: 310.43 us, 0.22 tflops, 0.03 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 2046.59 us, 0.03 tflops, 0.00 TB/s
+Custom Attention: 251.92 us, 0.27 tflops, 0.03 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 4559.52 us, 0.12 tflops, 0.01 TB/s
+Custom Attention: 1742.56 us, 0.31 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 4051.24 us, 0.03 tflops, 0.00 TB/s
+Custom Attention: 432.32 us, 0.31 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 9166.04 us, 0.12 tflops, 0.01 TB/s
+Custom Attention: 3362.45 us, 0.32 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 8049.49 us, 0.03 tflops, 0.00 TB/s
+Custom Attention: 781.48 us, 0.34 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 18348.92 us, 0.12 tflops, 0.01 TB/s
+Custom Attention: 6655.50 us, 0.32 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+
+
+
+V600:
+==== Batch Size 1, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 958.50 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 524.32 us, 0.26 tflops, 0.00 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 2315.59 us, 0.06 tflops, 0.00 TB/s
+Custom Attention: 279.80 us, 0.48 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 7519.86 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 3220.89 us, 0.33 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 4616.83 us, 0.06 tflops, 0.00 TB/s
+Custom Attention: 502.28 us, 0.53 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 15133.82 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 6301.86 us, 0.34 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 9196.05 us, 0.06 tflops, 0.00 TB/s
+Custom Attention: 952.76 us, 0.56 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 30341.94 us, 0.14 tflops, 0.00 TB/s
+Custom Attention: 12557.37 us, 0.34 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 1, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 277.29 us, 0.03 tflops, 0.00 TB/s
+Custom Attention: 108.32 us, 0.08 tflops, 0.01 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 1, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 591.01 us, 0.11 tflops, 0.01 TB/s
+Custom Attention: 302.68 us, 0.22 tflops, 0.03 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 2042.75 us, 0.03 tflops, 0.00 TB/s
+Custom Attention: 217.24 us, 0.31 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 8, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 4561.80 us, 0.12 tflops, 0.01 TB/s
+Custom Attention: 1725.04 us, 0.31 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 4032.79 us, 0.03 tflops, 0.00 TB/s
+Custom Attention: 378.20 us, 0.35 tflops, 0.05 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 16, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 9149.17 us, 0.12 tflops, 0.01 TB/s
+Custom Attention: 3329.09 us, 0.32 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 256 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 8030.97 us, 0.03 tflops, 0.00 TB/s
+Custom Attention: 682.16 us, 0.39 tflops, 0.05 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+==== Batch Size 32, Context Len 2048 ====
+==== Case 0 ====
+[aiter] 
+Naive Attention: 18325.21 us, 0.12 tflops, 0.01 TB/s
+Custom Attention: 6570.18 us, 0.33 tflops, 0.04 TB/s[checkAllclose atol=0.01 rtol=0.01 passed~]
+
+
+
+
+Optimized Paged Attention Fix:
+Timestamp,BatchSize,ContextLen,NumQHeads,NumKVHeads,HeadSize,Naive_Time_us,Custom_Time_us,Speedup
+2025-12-29 06:22:34,1,256,64,1,256,294.81,155.28,1.90
+2025-12-29 06:22:34,1,2048,64,1,256,951.70,1106.40,0.86
+2025-12-29 06:22:35,8,256,64,1,256,2224.91,148.56,14.98
+2025-12-29 06:22:35,8,2048,64,1,256,7419.78,1000.04,7.42
+2025-12-29 06:22:36,16,256,64,1,256,4461.99,181.96,24.52
+2025-12-29 06:22:37,16,2048,64,1,256,14965.96,1291.72,11.59
+2025-12-29 06:22:40,32,256,64,1,256,8848.45,251.08,35.24
+2025-12-29 06:22:42,32,2048,64,1,256,29959.64,1867.05,16.05
+2025-12-29 06:22:42,1,256,64,8,128,268.21,78.52,3.42
+2025-12-29 06:22:42,1,2048,64,8,128,580.45,452.00,1.28
+2025-12-29 06:22:43,8,256,64,8,128,1961.11,86.96,22.55
+2025-12-29 06:22:44,8,2048,64,8,128,4473.28,504.64,8.86
+2025-12-29 06:22:45,16,256,64,8,128,3866.14,101.24,38.19
+2025-12-29 06:22:46,16,2048,64,8,128,8987.93,620.08,14.49
+2025-12-29 06:22:48,32,256,64,8,128,7685.51,138.08,55.66
+2025-12-29 06:22:50,32,2048,64,8,128,17999.26,885.48,20.33
+
+Optimized Paged Attention V3 (Hybrid Split-K):
+Timestamp,BatchSize,ContextLen,NumQHeads,NumKVHeads,HeadSize,Naive_Time_us,Custom_Time_us,Speedup
+2025-12-29 06:30:07,1,256,64,1,256,312.01,157.04,1.99
+2025-12-29 06:30:07,1,2048,64,1,256,962.46,273.80,3.52
+2025-12-29 06:30:08,8,256,64,1,256,2318.03,149.72,15.48
+2025-12-29 06:30:09,8,2048,64,1,256,7507.30,995.24,7.54
+2025-12-29 06:30:10,16,256,64,1,256,4636.51,183.96,25.20
+2025-12-29 06:30:11,16,2048,64,1,256,15130.54,1314.16,11.51
+2025-12-29 06:30:13,32,256,64,1,256,9206.86,258.28,35.65
+2025-12-29 06:30:15,32,2048,64,1,256,30279.48,1925.93,15.72
+2025-12-29 06:30:15,1,256,64,8,128,278.25,80.32,3.46
+2025-12-29 06:30:15,1,2048,64,8,128,589.85,141.48,4.17
+2025-12-29 06:30:16,8,256,64,8,128,2057.31,90.00,22.86
+2025-12-29 06:30:17,8,2048,64,8,128,4566.40,512.36,8.91
+2025-12-29 06:30:18,16,256,64,8,128,4068.95,103.32,39.38
+2025-12-29 06:30:19,16,2048,64,8,128,9160.99,626.52,14.62
+2025-12-29 06:30:21,32,256,64,8,128,8091.41,140.08,57.76
+2025-12-29 06:30:23,32,2048,64,8,128,18347.18,887.32,20.68
+
+
+
+
+
+
+
+Optimized Paged Attention V4 (FastPath + Safe)
+
+Timestamp,BatchSize,ContextLen,NumQHeads,NumKVHeads,HeadSize,Naive_Time_us,Custom_Time_us,Speedup
+2025-12-29 06:36:29,1,256,64,1,256,303.53,164.68,1.84
+2025-12-29 06:36:30,1,2048,64,1,256,957.42,294.28,3.25
+2025-12-29 06:36:30,8,256,64,1,256,2303.75,159.16,14.47
+2025-12-29 06:36:31,8,2048,64,1,256,7504.49,1076.64,6.97
+2025-12-29 06:36:32,16,256,64,1,256,4596.46,178.24,25.79
+2025-12-29 06:36:33,16,2048,64,1,256,15146.67,1200.88,12.61
+2025-12-29 06:36:35,32,256,64,1,256,9138.78,311.80,29.31
+2025-12-29 06:36:37,32,2048,64,1,256,30322.02,2288.01,13.25
+2025-12-29 06:36:38,1,256,64,8,128,272.81,55.08,4.95
+2025-12-29 06:36:38,1,2048,64,8,128,588.49,88.36,6.66
+2025-12-29 06:36:39,8,256,64,8,128,2019.67,69.84,28.92
+2025-12-29 06:36:39,8,2048,64,8,128,4557.76,357.04,12.77
+2025-12-29 06:36:40,16,256,64,8,128,3989.02,87.12,45.79
+2025-12-29 06:36:41,16,2048,64,8,128,9149.45,483.72,18.91
+2025-12-29 06:36:44,32,256,64,8,128,7903.42,124.76,63.35
+2025-12-29 06:36:46,32,2048,64,8,128,18299.53,789.88,23.17
+
+
+
+
+Optimized Paged Attention V5 (Hybrid)
+Timestamp,BatchSize,ContextLen,NumQHeads,NumKVHeads,HeadSize,Naive_Time_us,Custom_Time_us,Speedup
+2025-12-29 06:45:25,1,256,64,1,256,308.18,161.44,1.91
+2025-12-29 06:45:25,1,2048,64,1,256,956.07,165.08,5.79
+2025-12-29 06:45:26,8,256,64,1,256,2287.86,149.16,15.34
+2025-12-29 06:45:26,8,2048,64,1,256,7506.61,990.01,7.58
+2025-12-29 06:45:27,16,256,64,1,256,4576.47,181.12,25.27
+2025-12-29 06:45:28,16,2048,64,1,256,15134.47,1277.10,11.85
+2025-12-29 06:45:30,32,256,64,1,256,9139.76,253.64,36.03
+2025-12-29 06:45:33,32,2048,64,1,256,30277.99,1876.10,16.14
+2025-12-29 06:45:33,1,256,64,8,128,272.98,54.80,4.98
+2025-12-29 06:45:33,1,2048,64,8,128,586.70,87.88,6.68
+2025-12-29 06:45:34,8,256,64,8,128,2010.09,69.80,28.80
+2025-12-29 06:45:34,8,2048,64,8,128,4546.49,357.64,12.71
+2025-12-29 06:45:35,16,256,64,8,128,3993.63,86.68,46.07
+2025-12-29 06:45:37,16,2048,64,8,128,9120.42,480.52,18.98
+2025-12-29 06:45:39,32,256,64,8,128,7951.40,125.16,63.53
+2025-12-29 06:45:41,32,2048,64,8,128,18328.32,904.69,20.26
+
+
+Optimized Paged Attention V6 (Aggressive Occupancy)
+Timestamp,BatchSize,ContextLen,NumQHeads,NumKVHeads,HeadSize,Naive_Time_us,Custom_Time_us,Speedup
+2025-12-29 06:53:25,1,256,64,1,256,309.97,53.12,5.84
+2025-12-29 06:53:25,1,2048,64,1,256,955.21,165.20,5.78
+2025-12-29 06:53:26,8,256,64,1,256,2292.99,146.60,15.64
+2025-12-29 06:53:27,8,2048,64,1,256,7496.42,978.56,7.66
+2025-12-29 06:53:28,16,256,64,1,256,4595.75,180.08,25.52
+2025-12-29 06:53:29,16,2048,64,1,256,15121.44,1271.60,11.89
+2025-12-29 06:53:31,32,256,64,1,256,9137.18,252.32,36.21
+2025-12-29 06:53:33,32,2048,64,1,256,30287.07,1864.13,16.25
+2025-12-29 06:53:33,1,256,64,8,128,275.01,43.28,6.35
+2025-12-29 06:53:33,1,2048,64,8,128,589.10,88.36,6.67
+2025-12-29 06:53:34,8,256,64,8,128,2026.11,68.96,29.38
+2025-12-29 06:53:35,8,2048,64,8,128,4552.56,357.12,12.75
+2025-12-29 06:53:36,16,256,64,8,128,3981.26,86.24,46.17
+2025-12-29 06:53:37,16,2048,64,8,128,9127.49,480.04,19.01
+2025-12-29 06:53:39,32,256,64,8,128,7903.45,124.48,63.49
+2025-12-29 06:53:41,32,2048,64,8,128,18255.61,886.36,20.60
+
+
+
+Optimized Paged Attention V7 (Universal FastPath)
+Timestamp,BatchSize,ContextLen,NumQHeads,NumKVHeads,HeadSize,Naive_Time_us,Custom_Time_us,Speedup
+2025-12-29 07:05:43,1,256,64,1,256,307.20,50.51,6.08
+2025-12-29 07:05:43,1,2048,64,1,256,960.83,118.11,8.13
+2025-12-29 07:05:44,8,256,64,1,256,2308.12,86.67,26.63
+2025-12-29 07:05:44,8,2048,64,1,256,7536.22,411.02,18.34
+2025-12-29 07:05:45,16,256,64,1,256,4613.04,134.07,34.41
+2025-12-29 07:05:47,16,2048,64,1,256,15152.05,777.26,19.49
+2025-12-29 07:05:49,32,256,64,1,256,9159.53,215.19,42.56
+2025-12-29 07:05:51,32,2048,64,1,256,30388.94,1480.44,20.53
+2025-12-29 07:05:51,1,256,64,8,128,275.72,44.64,6.18
+2025-12-29 07:05:51,1,2048,64,8,128,591.80,76.59,7.73
+2025-12-29 07:05:52,8,256,64,8,128,2037.41,64.79,31.44
+2025-12-29 07:05:53,8,2048,64,8,128,4574.06,215.03,21.27
+2025-12-29 07:05:54,16,256,64,8,128,4014.54,86.43,46.45
+2025-12-29 07:05:55,16,2048,64,8,128,9170.81,405.15,22.64
+2025-12-29 07:05:57,32,256,64,8,128,7984.04,125.27,63.73
+2025-12-29 07:05:59,32,2048,64,8,128,18362.38,801.74,22.90
+
+
+
+Optimized Paged Attention V9 (Multi-Warp Block)
+Timestamp,BatchSize,ContextLen,NumQHeads,NumKVHeads,HeadSize,Naive_Time_us,Custom_Time_us,Speedup
+2025-12-29 07:32:07,1,256,64,1,256,308.45,55.52,5.56
+2025-12-29 07:32:07,1,2048,64,1,256,957.73,121.84,7.86
+2025-12-29 07:32:08,8,256,64,1,256,2294.30,89.40,25.66
+2025-12-29 07:32:08,8,2048,64,1,256,7510.93,427.16,17.58
+2025-12-29 07:32:09,16,256,64,1,256,4604.06,135.16,34.06
+2025-12-29 07:32:11,16,2048,64,1,256,15169.86,771.03,19.67
+2025-12-29 07:32:12,32,256,64,1,256,9142.20,213.72,42.78
+2025-12-29 07:32:15,32,2048,64,1,256,30388.97,1462.84,20.77
+2025-12-29 07:32:15,1,256,64,8,128,275.01,49.36,5.57
+2025-12-29 07:32:15,1,2048,64,8,128,590.85,79.56,7.43
+2025-12-29 07:32:16,8,256,64,8,128,2033.94,66.68,30.50
+2025-12-29 07:32:17,8,2048,64,8,128,4568.29,225.08,20.30
+2025-12-29 07:32:18,16,256,64,8,128,4025.28,87.20,46.16
+2025-12-29 07:32:19,16,2048,64,8,128,9157.59,399.64,22.91
+2025-12-29 07:32:21,32,256,64,8,128,8002.24,123.92,64.58
+2025-12-29 07:32:23,32,2048,64,8,128,18331.91,736.44,24.89
+
+
+
+
+Optimized Paged Attention V16 (Template Specialized)
+Timestamp,BatchSize,ContextLen,NumQHeads,NumKVHeads,HeadSize,Naive_Time_us,Custom_Time_us,Speedup
+2025-12-29 08:28:51,1,256,64,1,256,308.81,54.84,5.63
+2025-12-29 08:28:51,1,2048,64,1,256,964.24,101.72,9.48
+2025-12-29 08:28:52,8,256,64,1,256,2300.08,89.64,25.66
+2025-12-29 08:28:53,8,2048,64,1,256,7517.37,404.59,18.58
+2025-12-29 08:28:54,16,256,64,1,256,4611.13,134.39,34.31
+2025-12-29 08:28:55,16,2048,64,1,256,15072.53,765.35,19.69
+2025-12-29 08:28:57,32,256,64,1,256,9163.35,213.00,43.02
+2025-12-29 08:28:59,32,2048,64,1,256,30317.08,1456.27,20.82
+2025-12-29 08:29:00,1,256,64,8,128,273.45,45.68,5.99
+2025-12-29 08:29:00,1,2048,64,8,128,589.45,78.84,7.48
+2025-12-29 08:29:01,8,256,64,8,128,2033.53,66.44,30.61
+2025-12-29 08:29:01,8,2048,64,8,128,4563.03,213.47,21.38
+2025-12-29 08:29:02,16,256,64,8,128,4017.74,86.48,46.46
+2025-12-29 08:29:04,16,2048,64,8,128,9143.54,399.15,22.91
+2025-12-29 08:29:06,32,256,64,8,128,7989.19,124.24,64.31
+2025-12-29 08:29:08,32,2048,64,8,128,18171.80,733.87,24.76
+
+Timestamp,BatchSize,ContextLen,NumQHeads,NumKVHeads,HeadSize,Naive_Time_us,Custom_Time_us,Speedup
+2025-12-30 06:00:08,1,256,64,1,256,309.49,54.40,5.69
+2025-12-30 06:00:08,1,2048,64,1,256,960.54,101.92,9.42
+2025-12-30 06:00:09,8,256,64,1,256,2318.37,89.16,26.00
+2025-12-30 06:00:09,8,2048,64,1,256,7516.14,409.52,18.35
+2025-12-30 06:00:10,16,256,64,1,256,4642.70,134.12,34.62
+2025-12-30 06:00:12,16,2048,64,1,256,15171.57,768.28,19.75
+2025-12-30 06:00:14,32,256,64,1,256,9178.27,213.32,43.03
+2025-12-30 06:00:16,32,2048,64,1,256,30417.38,1458.57,20.85
+2025-12-30 06:00:16,1,256,64,8,128,274.57,45.16,6.08
+2025-12-30 06:00:16,1,2048,64,8,128,591.94,78.28,7.56
+2025-12-30 06:00:17,8,256,64,8,128,2035.51,65.84,30.92
+2025-12-30 06:00:18,8,2048,64,8,128,4560.27,212.60,21.45
+2025-12-30 06:00:19,16,256,64,8,128,4047.37,86.04,47.04
+2025-12-30 06:00:20,16,2048,64,8,128,9171.06,400.88,22.88
+2025-12-30 06:00:22,32,256,64,8,128,8044.39,124.32,64.71
+2025-12-30 06:00:24,32,2048,64,8,128,18333.85,737.09,24.87

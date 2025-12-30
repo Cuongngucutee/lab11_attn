@@ -1,0 +1,3514 @@
+
+#include <torch/torch.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h> 
+#include <ATen/hip/HIPContext.h> 
+#include <vector>
+#include <cmath>
+
+using torch::Tensor;
+
+#define WARP_SIZE 64
+
+// -------------------------------------------------------------------------
+// Vectorized Types for 128-bit access (8x BF16)
+// -------------------------------------------------------------------------
+typedef struct alignas(16) {
+    hip_bfloat16 data[8];
+} bf16x8;
+
+// -------------------------------------------------------------------------
+// Hợp lệ hóa quy tắc: Kernel khởi tạo thay torch::full
+// -------------------------------------------------------------------------
+__global__ void fill_f32_v600(float* ptr, float val, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) ptr[idx] = val;
+}
+
+// -------------------------------------------------------------------------
+// Fast Warp Reductions
+// -------------------------------------------------------------------------
+__device__ __forceinline__ float warp_sum_v600(float val) {
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2)
+        val += __shfl_xor(val, offset, WARP_SIZE);
+    return val;
+}
+
+__device__ __forceinline__ float block_sum_v600(float val, float* shared_res) {
+    int tid = threadIdx.x; int wid = tid / WARP_SIZE; int lane = tid % WARP_SIZE;
+    val = warp_sum_v600(val);
+    if (lane == 0) shared_res[wid] = val;
+    __syncthreads();
+    val = (tid < (int)(blockDim.x / WARP_SIZE)) ? shared_res[tid] : 0.0f;
+    if (wid == 0) val = warp_sum_v600(val);
+    if (tid == 0) shared_res[0] = val;
+    __syncthreads();
+    return shared_res[0];
+}
+
+// -------------------------------------------------------------------------
+// Kernel 1: Warp-Parallel (Tối ưu cho Latency - Context ngắn)
+// -------------------------------------------------------------------------
+__global__ void kernel_warp_parallel_v600(
+    const hip_bfloat16* __restrict__ q, const hip_bfloat16* __restrict__ k_cache, const hip_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ block_tables, const int64_t* __restrict__ kv_lens, const int64_t* __restrict__ q_lens,
+    hip_bfloat16* __restrict__ output, const int num_kv_heads, const int num_q_heads, const int block_size,
+    const float scale, const float soft_cap, const int head_size, const int max_blocks_per_seq, const int num_seqs,
+    const long long q_s0, const long long q_s1, const long long q_s2,
+    const long long k_s0, const long long k_s1, const long long k_s2, const long long k_s3,
+    const long long v_s0, const long long v_s1, const long long v_s2, const long long v_s3
+) {
+    extern __shared__ float s_mem[];
+    float* s_query = s_mem; float* s_max = &s_mem[head_size];
+    float* s_sum = &s_mem[head_size + 32]; float* s_acc = &s_mem[head_size + 64];
+
+    const int q_token_idx = blockIdx.x; const int head_idx = blockIdx.y; 
+    const int tid = threadIdx.x; const int wid = tid / WARP_SIZE; const int lane = tid % WARP_SIZE;
+    const int num_warps = blockDim.x / WARP_SIZE;
+
+    // Inline Metadata Calculation
+    int seq_idx = 0; 
+    int current_q_start = 0;
+    if (num_seqs > 1) {
+        for (int i = 0; i < num_seqs; i++) {
+            if (q_token_idx >= current_q_start + (int)q_lens[i]) {
+                current_q_start += (int)q_lens[i];
+                seq_idx++;
+            } else break;
+        }
+    }
+    
+    const int kv_len = (int)kv_lens[seq_idx];
+    const int q_pos = q_token_idx - current_q_start;
+    const int causal_limit = kv_len - (int)q_lens[seq_idx] + q_pos;
+    const int kv_head_idx = head_idx / (num_q_heads / num_kv_heads);
+
+    if (tid < head_size) s_query[tid] = static_cast<float>(q[q_token_idx * q_s0 + head_idx * q_s1 + tid * q_s2]) * scale;
+    __syncthreads();
+
+    float m_i = -1e20f, d_i = 0.0f;
+    float acc_local[8]; 
+    #pragma unroll
+    for(int j=0; j<8; j++) acc_local[j] = 0.0f;
+
+    for (int i = wid; i < kv_len; i += num_warps) {
+        if (i > causal_limit) break;
+        const int p_blk = block_tables[seq_idx * max_blocks_per_seq + (i / block_size)];
+        const int blk_off = i % block_size;
+        
+        float dot = 0.0f;
+        // Vectorized Dot Product Unrolling
+        #pragma unroll
+        for (int d = lane; d < head_size; d += WARP_SIZE) {
+            dot += s_query[d] * static_cast<float>(k_cache[p_blk * k_s0 + blk_off * k_s1 + kv_head_idx * k_s2 + d * k_s3]);
+        }
+        dot = warp_sum_v600(dot);
+        float score = __shfl(dot, 0, WARP_SIZE);
+
+        if (soft_cap > 0.0f) score = soft_cap * tanhf(score / soft_cap);
+
+        float m_next = fmaxf(m_i, score);
+        float p = expf(score - m_next);
+        float alpha = expf(m_i - m_next);
+        m_i = m_next; d_i = d_i * alpha + p;
+
+        #pragma unroll
+        for (int d = lane, e = 0; d < head_size; d += WARP_SIZE, e++) {
+            acc_local[e] = acc_local[e] * alpha + p * static_cast<float>(v_cache[p_blk * v_s0 + blk_off * v_s1 + kv_head_idx * v_s2 + d * v_s3]);
+        }
+    }
+
+    if (lane == 0) { s_max[wid] = m_i; s_sum[wid] = d_i; }
+    #pragma unroll
+    for (int d = lane, e = 0; d < head_size; d += WARP_SIZE, e++) {
+        s_acc[wid * head_size + d] = acc_local[e];
+    }
+    __syncthreads();
+
+    if (wid == 0) {
+        float g_max = -1e20f;
+        for (int w = 0; w < num_warps; w++) g_max = fmaxf(g_max, s_max[w]);
+        float g_sum = 0.0f;
+        for (int w = 0; w < num_warps; w++) g_sum += s_sum[w] * expf(s_max[w] - g_max);
+        #pragma unroll
+        for (int d = lane; d < head_size; d += WARP_SIZE) {
+            float f_acc = 0.0f;
+            #pragma unroll
+            for (int w = 0; w < num_warps; w++) f_acc += s_acc[w * head_size + d] * expf(s_max[w] - g_max);
+            output[q_token_idx * num_q_heads * head_size + head_idx * head_size + d] = static_cast<hip_bfloat16>(f_acc / (g_sum + 1e-10f));
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
+// Kernel 2: Split-KV (Tối ưu cho Throughput - Context dài)
+// -------------------------------------------------------------------------
+__global__ void kernel_split_v600(
+    const hip_bfloat16* __restrict__ q, const hip_bfloat16* __restrict__ k_cache, const hip_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ block_tables, const int64_t* __restrict__ kv_lens, const int64_t* __restrict__ q_lens,
+    float* __restrict__ partial_acc, float* __restrict__ partial_max, float* __restrict__ partial_sum,
+    const int num_splits, const int num_kv_heads, const int num_q_heads, const int head_size, const int block_size,
+    const float scale, const float soft_cap, const int max_blocks_per_seq, const int num_seqs,
+    const long long k_s0, const long long k_s1, const long long k_s2, const long long k_s3,
+    const long long v_s0, const long long v_s1, const long long v_s2, const long long v_s3
+) {
+    const int q_token_idx = blockIdx.x; const int head_idx = blockIdx.y; const int split_idx = blockIdx.z; const int tid = threadIdx.x;
+    extern __shared__ float s_mem[];
+    float* s_query = s_mem; float* s_res = &s_mem[head_size];
+
+    int seq_idx = 0; int current_q_start = 0;
+    if (num_seqs > 1) {
+        for (int i = 0; i < num_seqs; i++) {
+            if (q_token_idx >= current_q_start + (int)q_lens[i]) {
+                current_q_start += (int)q_lens[i]; seq_idx++;
+            } else break;
+        }
+    }
+    
+    const int kv_len = (int)kv_lens[seq_idx];
+    const int causal_limit = kv_len - (int)q_lens[seq_idx] + (q_token_idx - current_q_start);
+    
+    if (tid < head_size) s_query[tid] = static_cast<float>(q[q_token_idx * (num_q_heads * head_size) + head_idx * head_size + tid]) * scale;
+    __syncthreads();
+
+    const int t_per_split = (kv_len + num_splits - 1) / num_splits;
+    const int start = split_idx * t_per_split; const int end = min(start + t_per_split, causal_limit + 1);
+    if (start >= end) return;
+
+    float m_i = -1e20f, d_i = 0.0f, acc_val = 0.0f;
+    const int kv_head_idx = head_idx / (num_q_heads / num_kv_heads);
+
+    for (int i = start; i < end; i++) {
+        const int p_blk = block_tables[seq_idx * max_blocks_per_seq + (i / block_size)];
+        const int blk_off = i % block_size;
+        float dot = (tid < head_size) ? (s_query[tid] * static_cast<float>(k_cache[p_blk * k_s0 + blk_off * k_s1 + kv_head_idx * k_s2 + tid * k_s3])) : 0.0f;
+        float score = block_sum_v600(dot, s_res);
+        if (soft_cap > 0.0f) score = soft_cap * tanhf(score / soft_cap);
+        float m_next = fmaxf(m_i, score), p = expf(score - m_next), alpha = expf(m_i - m_next);
+        m_i = m_next; d_i = d_i * alpha + p;
+        if (tid < head_size) acc_val = acc_val * alpha + p * static_cast<float>(v_cache[p_blk * v_s0 + blk_off * v_s1 + kv_head_idx * v_s2 + tid * v_s3]);
+    }
+    if (tid < head_size) partial_acc[((q_token_idx * num_q_heads + head_idx) * num_splits + split_idx) * head_size + tid] = acc_val;
+    if (tid == 0) { int base = (q_token_idx * num_q_heads + head_idx) * num_splits + split_idx; partial_max[base] = m_i; partial_sum[base] = d_i; }
+}
+
+__global__ void kernel_combine_v600(const float* p_acc, const float* p_max, const float* p_sum, hip_bfloat16* output, int n_splits, int h_size, int n_heads) {
+    const int q_idx = blockIdx.x; const int h_idx = blockIdx.y; const int tid = threadIdx.x;
+    if (tid >= h_size) return;
+    const int base = (q_idx * n_heads + h_idx) * n_splits;
+    float g_max = -1e20f; for (int s = 0; s < n_splits; s++) g_max = fmaxf(g_max, p_max[base + s]);
+    float g_sum = 0.0f, f_acc = 0.0f;
+    for (int s = 0; s < n_splits; s++) {
+        float m_s = p_max[base + s]; if (m_s < -1e10f) continue;
+        float alpha = expf(m_s - g_max); g_sum += alpha * p_sum[base + s];
+        f_acc += alpha * p_acc[(base + s) * h_size + tid];
+    }
+    output[q_idx * n_heads * h_size + h_idx * h_size + tid] = static_cast<hip_bfloat16>(f_acc / (g_sum + 1e-10f));
+}
+
+// -------------------------------------------------------------------------
+// Host Code: No PyTorch Forbidden Functions
+// -------------------------------------------------------------------------
+Tensor custom_paged_attn(
+    const Tensor& query, const Tensor& key_cache, const Tensor& value_cache,
+    const std::vector<int64_t>& query_lens, const std::vector<int64_t>& kv_lens,
+    Tensor block_tables, double scale, double soft_cap = -1.0
+) {
+    const int num_seqs = query_lens.size(); const int total_q = query.size(0);
+    const int num_h = query.size(1); const int head_s = query.size(2);
+    hipStream_t stream = at::hip::getCurrentHIPStream().stream();
+    Tensor output = torch::empty({total_q, num_h, head_s}, query.options());
+
+    // Cấp phát lens Metadata trực tiếp (Dùng torch::empty hợp lệ)
+    auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(query.device());
+    Tensor q_lens_gpu = torch::empty({num_seqs}, opts_i64);
+    Tensor kv_lens_gpu = torch::empty({num_seqs}, opts_i64);
+    hipMemcpyAsync(q_lens_gpu.data_ptr(), query_lens.data(), num_seqs * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+    hipMemcpyAsync(kv_lens_gpu.data_ptr(), kv_lens.data(), num_seqs * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+
+    int avg_kv = 0; for(auto l : kv_lens) avg_kv += (int)l; avg_kv /= num_seqs;
+
+    if (avg_kv <= 512) {
+        size_t shmem = (head_s + 64 + 8 * head_s) * sizeof(float);
+        kernel_warp_parallel_v600<<<dim3(total_q, num_h), dim3(8 * WARP_SIZE), shmem, stream>>>(
+            (hip_bfloat16*)query.data_ptr(), (hip_bfloat16*)key_cache.data_ptr(), (hip_bfloat16*)value_cache.data_ptr(),
+            block_tables.data_ptr<int>(), kv_lens_gpu.data_ptr<int64_t>(), q_lens_gpu.data_ptr<int64_t>(),
+            (hip_bfloat16*)output.data_ptr(), (int)key_cache.size(2), num_h, (int)key_cache.size(1), (float)scale, (float)soft_cap, head_s, (int)block_tables.size(1), num_seqs,
+            query.stride(0), query.stride(1), query.stride(2), key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), key_cache.stride(3), value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), value_cache.stride(3)
+        );
+    } else {
+        int num_splits = (num_seqs == 1) ? 128 : 64;
+        auto opts_f32 = query.options().dtype(torch::kFloat32);
+        Tensor p_acc = torch::empty({total_q, num_h, num_splits, head_s}, opts_f32);
+        Tensor p_max = torch::empty({total_q, num_h, num_splits}, opts_f32);
+        Tensor p_sum = torch::empty({total_q, num_h, num_splits}, opts_f32);
+        int s_max_fill = total_q * num_h * num_splits;
+        fill_f32_v600<<<(s_max_fill + 255) / 256, 256, 0, stream>>>(p_max.data_ptr<float>(), -1e20f, s_max_fill);
+
+        size_t shmem = (head_s + 64) * sizeof(float);
+        kernel_split_v600<<<dim3(total_q, num_h, num_splits), dim3(std::max(head_s, 64)), shmem, stream>>>(
+            (hip_bfloat16*)query.data_ptr(), (hip_bfloat16*)key_cache.data_ptr(), (hip_bfloat16*)value_cache.data_ptr(),
+            block_tables.data_ptr<int>(), kv_lens_gpu.data_ptr<int64_t>(), q_lens_gpu.data_ptr<int64_t>(),
+            p_acc.data_ptr<float>(), p_max.data_ptr<float>(), p_sum.data_ptr<float>(),
+            num_splits, (int)key_cache.size(2), num_h, head_s, (int)key_cache.size(1), (float)scale, (float)soft_cap, (int)block_tables.size(1), num_seqs,
+            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), key_cache.stride(3), value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), value_cache.stride(3)
+        );
+        kernel_combine_v600<<<dim3(total_q, num_h), head_s, 0, stream>>>(p_acc.data_ptr<float>(), p_max.data_ptr<float>(), p_sum.data_ptr<float>(), (hip_bfloat16*)output.data_ptr(), num_splits, head_s, num_h);
+    }
+    return output;
+}
+
+PYBIND11_MODULE(custom_attn, m) {
+    m.def("custom_paged_attn", &custom_paged_attn, "V600 Extreme GFX90A Tuned");
+}
+
+
+
+#include <torch/torch.h>
+#include <ATen/hip/HIPContext.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
+#include <vector>
+#include <cmath>
+
+using torch::Tensor;
+
+#define WARP_SIZE 64
+
+// Structure for vectorized load (16 bytes = 128 bits)
+struct alignas(16) Vec128 {
+    union {
+        float4 f4;
+        hip_bfloat16 bf16[8];
+    };
+};
+
+// --- Helper Functions ---
+
+__device__ __forceinline__ float vec_dot(const Vec128& a, const Vec128& b) {
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sum += static_cast<float>(a.bf16[i]) * static_cast<float>(b.bf16[i]);
+    }
+    return sum;
+}
+
+// --- Kernel Implementation ---
+
+template<int HEAD_SIZE, int BLOCK_SIZE>
+__global__ void paged_attn_kernel_opt(
+    hip_bfloat16* __restrict__ output,
+    const hip_bfloat16* __restrict__ q,
+    const hip_bfloat16* __restrict__ k_cache,
+    const hip_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ block_tables,
+    const int64_t* __restrict__ kv_lens,
+    const int64_t* __restrict__ q_lens,
+    const float scale,
+    const int max_num_blocks_per_seq,
+    const int q_stride_0, const int q_stride_1,
+    const int k_stride_block, const int k_stride_token, const int k_stride_head,
+    const int v_stride_block, const int v_stride_token, const int v_stride_head,
+    const int num_kv_heads
+) {
+    // 1. Identify Sequence and Token Info
+    const int q_token_global_idx = blockIdx.x; 
+    const int head_idx = blockIdx.y;
+    
+    // Linear scan to find which sequence this token belongs to
+    // (Optimized for decoding where batch size is small < 256 usually)
+    int local_seq_idx = 0;
+    int current_q_start = 0;
+    int q_len_val = 0;
+    
+    // Simple robust scan
+    if (gridDim.x > 1) {
+       // Heuristic: usually num_seqs is close to gridDim.x for decoding
+       // Use a simple loop.
+       // NOTE: Assuming q_lens_gpu is available and correct.
+       // Since we don't pass num_seqs explicitly, we iterate until we find the range.
+       // Safety: Max iterations = gridDim.x (worst case 1 token per seq)
+       int limit = gridDim.x; 
+       for(int i=0; i < limit; ++i) {
+           int len = (int)q_lens[i];
+           if (q_token_global_idx < current_q_start + len) {
+               local_seq_idx = i;
+               q_len_val = len;
+               break;
+           }
+           current_q_start += len;
+       }
+    } else {
+       q_len_val = (int)q_lens[0];
+    }
+    
+    const int kv_len = (int)kv_lens[local_seq_idx];
+    const int q_pos_in_seq = q_token_global_idx - current_q_start;
+    
+    // GQA Handling
+    const int num_q_heads = gridDim.y;
+    // Safety check for division
+    const int group_size = num_q_heads / num_kv_heads; 
+    const int kv_head_idx = head_idx / group_size;
+
+    // 2. Load Q (Vectorized)
+    const int VECS_PER_HEAD = HEAD_SIZE / 8;
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+
+    Vec128 q_vec;
+    #pragma unroll
+    for(int i=0; i<8; ++i) q_vec.bf16[i] = hip_bfloat16(0.0f);
+
+    if (tid < VECS_PER_HEAD) {
+        // q is [Total_Tokens, Num_Heads, Head_Size]
+        // Address: Base + Token*S0 + Head*S1
+        // We reinterpret_cast to float4* to load 16 bytes.
+        // Important: S1 (Head Stride) is usually Head_Size. 
+        // We assume contiguous last dim for vector load.
+        const float4* q_ptr_f4 = reinterpret_cast<const float4*>(
+            q + q_token_global_idx * q_stride_0 + head_idx * q_stride_1
+        );
+        q_vec.f4 = q_ptr_f4[tid]; // tid acts as vector offset here
+        
+        // Scale Q
+        #pragma unroll
+        for(int i=0; i<8; ++i) {
+             float val = static_cast<float>(q_vec.bf16[i]);
+             q_vec.bf16[i] = hip_bfloat16(val * scale);
+        }
+    }
+
+    // Broadcast Q to all threads in Warp
+    // Threads [0..VECS-1] hold Q. We broadcast to [VECS..2*VECS-1], etc.
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float val = static_cast<float>(q_vec.bf16[i]);
+        // Broadcast from the lane that owns this part of Q
+        val = __shfl(val, lane_id % VECS_PER_HEAD, WARP_SIZE);
+        q_vec.bf16[i] = hip_bfloat16(val);
+    }
+    
+    // 3. Accumulators
+    float m_i = -1e20f; 
+    float l_i = 0.0f;   
+    float acc[8] = {0.0f};
+
+    // 4. Iterate over Blocks
+    const int num_logical_blocks = (kv_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    constexpr int TOKENS_PER_WARP = WARP_SIZE / VECS_PER_HEAD;
+    const int token_idx_in_group = tid / VECS_PER_HEAD; 
+    const int vec_idx = tid % VECS_PER_HEAD;
+    
+    const int* my_block_table = block_tables + local_seq_idx * max_num_blocks_per_seq;
+    const int causal_limit = kv_len - q_len_val + q_pos_in_seq;
+
+    for (int blk_idx = 0; blk_idx < num_logical_blocks; ++blk_idx) {
+        const int phys_block = my_block_table[blk_idx];
+        
+        // Process multiple tokens in parallel within the block
+        for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+            int current_token_off = t + token_idx_in_group; // 0, 1, 2, 3...
+            int global_kv_idx = blk_idx * BLOCK_SIZE + current_token_off;
+            
+            bool active = (current_token_off < BLOCK_SIZE) && 
+                          (global_kv_idx < kv_len) && 
+                          (global_kv_idx <= causal_limit);
+            
+            if (!active) continue;
+
+            // --- Load K ---
+            // Key Cache Shape: [Blocks, BlockSize, KV_Heads, HeadDim]
+            // We use the passed strides.
+            // Offset logic: Block*S_Block + Token*S_Token + Head*S_Head
+            long long k_offset = (long long)phys_block * k_stride_block + 
+                                 (long long)current_token_off * k_stride_token + 
+                                 (long long)kv_head_idx * k_stride_head;
+                                 
+            const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+            Vec128 k_vec;
+            k_vec.f4 = k_ptr[vec_idx]; // vec_idx offset is handled by float4 pointer arithmetic
+
+            // --- Compute Score ---
+            float score = vec_dot(q_vec, k_vec);
+            
+            // Sum score across the vector lanes (reduce within the group)
+            #pragma unroll
+            for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) {
+                score += __shfl_xor(score, offset, WARP_SIZE);
+            }
+            
+            // --- Load V ---
+            long long v_offset = (long long)phys_block * v_stride_block + 
+                                 (long long)current_token_off * v_stride_token + 
+                                 (long long)kv_head_idx * v_stride_head;
+                                 
+            const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+            Vec128 v_vec;
+            v_vec.f4 = v_ptr[vec_idx]; 
+            
+            // Broadcast score to all lanes in the group (lane 0 of group has the sum)
+            // The lane holding the score is the first lane of the group: (tid / VECS) * VECS
+            score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+            
+            // --- Online Softmax Update ---
+            float m_prev = m_i;
+            m_i = fmaxf(m_i, score);
+            float exp_score = expf(score - m_i);
+            float correction = expf(m_prev - m_i);
+            
+            l_i = l_i * correction + exp_score;
+            
+            #pragma unroll
+            for(int i=0; i<8; ++i) {
+                acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+            }
+        }
+    }
+
+    // 5. Final Reduction across Warp Groups
+    // We have partial results in each group. We need to merge them.
+    
+    // Global Max
+    float global_m = m_i;
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) {
+        float other_m = __shfl_xor(global_m, offset, WARP_SIZE);
+        global_m = fmaxf(global_m, other_m);
+    }
+    
+    // Correct local sums based on global max
+    float correction_factor = expf(m_i - global_m);
+    float l_corrected = l_i * correction_factor;
+    
+    // Global Sum
+    float global_sum_l = l_corrected;
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) {
+        global_sum_l += __shfl_xor(global_sum_l, offset, WARP_SIZE);
+    }
+    
+    // Correct and Sum Accumulators
+    #pragma unroll
+    for(int i=0; i<8; ++i) acc[i] *= correction_factor;
+    
+    #pragma unroll
+    for(int i=0; i<8; ++i) {
+        #pragma unroll
+        for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) {
+            acc[i] += __shfl_xor(acc[i], offset, WARP_SIZE);
+        }
+    }
+    
+    // 6. Write Output
+    // Only the first group needs to write.
+    // And within the first group, threads correspond to vector indices.
+    if (token_idx_in_group == 0 && vec_idx < VECS_PER_HEAD) {
+        float inv_sum = 1.0f / (global_sum_l + 1e-6f);
+        
+        float4* out_ptr = reinterpret_cast<float4*>(
+             output + q_token_global_idx * num_q_heads * HEAD_SIZE + head_idx * HEAD_SIZE
+        );
+        
+        Vec128 out_vec;
+        #pragma unroll
+        for(int i=0; i<8; ++i) {
+            out_vec.bf16[i] = hip_bfloat16(acc[i] * inv_sum);
+        }
+        out_ptr[vec_idx] = out_vec.f4;
+    }
+}
+
+// --- Host Function ---
+
+Tensor custom_paged_attn(
+    const Tensor& query, const Tensor& key_cache, const Tensor& value_cache,
+    const std::vector<int64_t>& query_lens, const std::vector<int64_t>& kv_lens,
+    Tensor block_tables, double scale, double soft_cap = -1.0
+) {
+    const int total_q = query.size(0);
+    const int num_q_heads = query.size(1);
+    const int head_size = query.size(2);
+    
+    // Key Cache is passed as [Blocks, BlockSize, KV_Heads, Dim] (4D)
+    // Be careful with dimensions.
+    // In create_inputs: kv_cache is (Blocks, 2, BlockSize, KV_Heads, Dim)
+    // key_cache = kv_cache[:, 0] -> (Blocks, BlockSize, KV_Heads, Dim)
+    // So:
+    // dim 0: Blocks
+    // dim 1: BlockSize
+    // dim 2: KV_Heads
+    // dim 3: Dim
+    const int num_kv_heads = key_cache.size(2); // Fix: Used to be size(3) which was wrong
+    
+    const int max_blocks_per_seq = block_tables.size(1);
+    
+    hipStream_t stream = at::hip::getCurrentHIPStream().stream();
+    Tensor output = torch::empty_like(query);
+
+    auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(query.device());
+    Tensor q_lens_gpu = torch::empty({(long)query_lens.size()}, opts_i64);
+    Tensor kv_lens_gpu = torch::empty({(long)kv_lens.size()}, opts_i64);
+    
+    hipMemcpyAsync(q_lens_gpu.data_ptr(), query_lens.data(), query_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+    hipMemcpyAsync(kv_lens_gpu.data_ptr(), kv_lens.data(), kv_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+
+    dim3 grid(total_q, num_q_heads);
+    dim3 block(WARP_SIZE);
+    
+    // Pass Correct Strides
+    // Stride 0: Block Stride
+    // Stride 1: Token Stride (within block)
+    // Stride 2: Head Stride
+    // We ignore Stride 3 (Dim stride) because we assume contiguous 1.
+    
+    switch (head_size) {
+        case 64:
+            paged_attn_kernel_opt<64, 16><<<grid, block, 0, stream>>>(
+                (hip_bfloat16*)output.data_ptr(),
+                (hip_bfloat16*)query.data_ptr(),
+                (hip_bfloat16*)key_cache.data_ptr(),
+                (hip_bfloat16*)value_cache.data_ptr(),
+                block_tables.data_ptr<int>(),
+                kv_lens_gpu.data_ptr<int64_t>(),
+                q_lens_gpu.data_ptr<int64_t>(),
+                (float)scale,
+                max_blocks_per_seq,
+                query.stride(0), query.stride(1),
+                key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+                value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                num_kv_heads
+            );
+            break;
+        case 128:
+            paged_attn_kernel_opt<128, 16><<<grid, block, 0, stream>>>(
+                (hip_bfloat16*)output.data_ptr(),
+                (hip_bfloat16*)query.data_ptr(),
+                (hip_bfloat16*)key_cache.data_ptr(),
+                (hip_bfloat16*)value_cache.data_ptr(),
+                block_tables.data_ptr<int>(),
+                kv_lens_gpu.data_ptr<int64_t>(),
+                q_lens_gpu.data_ptr<int64_t>(),
+                (float)scale,
+                max_blocks_per_seq,
+                query.stride(0), query.stride(1),
+                key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+                value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                num_kv_heads
+            );
+            break;
+        case 256:
+            paged_attn_kernel_opt<256, 16><<<grid, block, 0, stream>>>(
+                (hip_bfloat16*)output.data_ptr(),
+                (hip_bfloat16*)query.data_ptr(),
+                (hip_bfloat16*)key_cache.data_ptr(),
+                (hip_bfloat16*)value_cache.data_ptr(),
+                block_tables.data_ptr<int>(),
+                kv_lens_gpu.data_ptr<int64_t>(),
+                q_lens_gpu.data_ptr<int64_t>(),
+                (float)scale,
+                max_blocks_per_seq,
+                query.stride(0), query.stride(1),
+                key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+                value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+                num_kv_heads
+            );
+            break;
+    }
+
+    return output;
+}
+
+PYBIND11_MODULE(custom_attn, m) {
+    m.def("custom_paged_attn", &custom_paged_attn, "Optimized Paged Attention Fix");
+}
+
+
+
+
+
+
+
+#include <torch/torch.h>
+#include <ATen/hip/HIPContext.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
+#include <vector>
+#include <cmath>
+
+using torch::Tensor;
+
+#define WARP_SIZE 64
+
+struct alignas(16) Vec128 {
+    union {
+        float4 f4;
+        hip_bfloat16 bf16[8];
+    };
+};
+
+__device__ __forceinline__ float vec_dot(const Vec128& a, const Vec128& b) {
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sum += static_cast<float>(a.bf16[i]) * static_cast<float>(b.bf16[i]);
+    }
+    return sum;
+}
+
+// --- Main Kernel ---
+template<int HEAD_SIZE, int BLOCK_SIZE>
+__global__ void paged_attn_kernel_opt(
+    hip_bfloat16* __restrict__ output,
+    float* __restrict__ temp_acc,      // [Total_Q, Heads, Splits, HeadSize]
+    float* __restrict__ temp_meta,     // [Total_Q, Heads, Splits, 2] (Max, Sum)
+    const hip_bfloat16* __restrict__ q,
+    const hip_bfloat16* __restrict__ k_cache,
+    const hip_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ block_tables,
+    const int64_t* __restrict__ kv_lens,
+    const int64_t* __restrict__ q_lens,
+    const float scale,
+    const int max_num_blocks_per_seq,
+    const int q_stride_0, const int q_stride_1,
+    const int k_stride_block, const int k_stride_token, const int k_stride_head,
+    const int v_stride_block, const int v_stride_token, const int v_stride_head,
+    const int num_kv_heads,
+    const int num_splits
+) {
+    const int q_token_global_idx = blockIdx.x; 
+    const int head_idx = blockIdx.y;
+    const int split_idx = blockIdx.z;
+
+    // Scan Sequence
+    int local_seq_idx = 0;
+    int current_q_start = 0;
+    int q_len_val = 0;
+    
+    if (gridDim.x > 1) {
+       int limit = gridDim.x; 
+       for(int i=0; i < limit; ++i) {
+           int len = (int)q_lens[i];
+           if (q_token_global_idx < current_q_start + len) {
+               local_seq_idx = i;
+               q_len_val = len;
+               break;
+           }
+           current_q_start += len;
+       }
+    } else {
+       q_len_val = (int)q_lens[0];
+    }
+    
+    const int kv_len = (int)kv_lens[local_seq_idx];
+    const int q_pos_in_seq = q_token_global_idx - current_q_start;
+    const int num_q_heads = gridDim.y;
+    const int group_size = num_q_heads / num_kv_heads; 
+    const int kv_head_idx = head_idx / group_size;
+
+    // Split Logic
+    const int total_logical_blocks = (kv_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int blocks_per_split = (total_logical_blocks + num_splits - 1) / num_splits;
+    const int start_blk = split_idx * blocks_per_split;
+    const int end_blk = min(start_blk + blocks_per_split, total_logical_blocks);
+    
+    // Init Empty Logic for inactive splits
+    if (start_blk >= end_blk) {
+        if (num_splits > 1 && threadIdx.x == 0) {
+            int meta_idx = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * 2;
+            temp_meta[meta_idx] = -1e20f;     // Max
+            temp_meta[meta_idx + 1] = 0.0f;   // Sum
+        }
+        return;
+    }
+
+    // Load Q
+    const int VECS_PER_HEAD = HEAD_SIZE / 8;
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+
+    Vec128 q_vec;
+    #pragma unroll
+    for(int i=0; i<8; ++i) q_vec.bf16[i] = hip_bfloat16(0.0f);
+
+    if (tid < VECS_PER_HEAD) {
+        const float4* q_ptr_f4 = reinterpret_cast<const float4*>(
+            q + q_token_global_idx * q_stride_0 + head_idx * q_stride_1
+        );
+        q_vec.f4 = q_ptr_f4[tid];
+        #pragma unroll
+        for(int i=0; i<8; ++i) {
+             float val = static_cast<float>(q_vec.bf16[i]);
+             q_vec.bf16[i] = hip_bfloat16(val * scale);
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float val = static_cast<float>(q_vec.bf16[i]);
+        val = __shfl(val, lane_id % VECS_PER_HEAD, WARP_SIZE);
+        q_vec.bf16[i] = hip_bfloat16(val);
+    }
+    
+    // Compute
+    float m_i = -1e20f; 
+    float l_i = 0.0f;   
+    float acc[8] = {0.0f};
+
+    constexpr int TOKENS_PER_WARP = WARP_SIZE / VECS_PER_HEAD;
+    const int token_idx_in_group = tid / VECS_PER_HEAD; 
+    const int vec_idx = tid % VECS_PER_HEAD;
+    const int* my_block_table = block_tables + local_seq_idx * max_num_blocks_per_seq;
+    const int causal_limit = kv_len - q_len_val + q_pos_in_seq;
+
+    for (int blk_idx = start_blk; blk_idx < end_blk; ++blk_idx) {
+        const int phys_block = my_block_table[blk_idx];
+        for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+            int current_token_off = t + token_idx_in_group;
+            int global_kv_idx = blk_idx * BLOCK_SIZE + current_token_off;
+            if (!((current_token_off < BLOCK_SIZE) && (global_kv_idx < kv_len) && (global_kv_idx <= causal_limit))) continue;
+
+            long long k_offset = (long long)phys_block * k_stride_block + (long long)current_token_off * k_stride_token + (long long)kv_head_idx * k_stride_head;
+            const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+            Vec128 k_vec; k_vec.f4 = k_ptr[vec_idx];
+
+            float score = vec_dot(q_vec, k_vec);
+            #pragma unroll
+            for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) score += __shfl_xor(score, offset, WARP_SIZE);
+            
+            long long v_offset = (long long)phys_block * v_stride_block + (long long)current_token_off * v_stride_token + (long long)kv_head_idx * v_stride_head;
+            const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+            Vec128 v_vec; v_vec.f4 = v_ptr[vec_idx]; 
+            
+            score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+            float m_prev = m_i;
+            m_i = fmaxf(m_i, score);
+            float exp_score = expf(score - m_i);
+            float correction = expf(m_prev - m_i);
+            l_i = l_i * correction + exp_score;
+            #pragma unroll
+            for(int i=0; i<8; ++i) acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+        }
+    }
+
+    // Reduce
+    float global_m = m_i;
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) global_m = fmaxf(global_m, __shfl_xor(global_m, offset, WARP_SIZE));
+    float correction_factor = expf(m_i - global_m);
+    float l_corrected = l_i * correction_factor;
+    float global_sum_l = l_corrected;
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) global_sum_l += __shfl_xor(global_sum_l, offset, WARP_SIZE);
+    
+    #pragma unroll
+    for(int i=0; i<8; ++i) acc[i] *= correction_factor;
+    #pragma unroll
+    for(int i=0; i<8; ++i) {
+        #pragma unroll
+        for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) acc[i] += __shfl_xor(acc[i], offset, WARP_SIZE);
+    }
+    
+    // Write
+    if (token_idx_in_group == 0 && vec_idx < VECS_PER_HEAD) {
+        if (num_splits == 1) {
+            float inv_sum = 1.0f / (global_sum_l + 1e-6f);
+            float4* out_ptr = reinterpret_cast<float4*>(output + q_token_global_idx * num_q_heads * HEAD_SIZE + head_idx * HEAD_SIZE);
+            Vec128 out_vec;
+            #pragma unroll
+            for(int i=0; i<8; ++i) out_vec.bf16[i] = hip_bfloat16(acc[i] * inv_sum);
+            out_ptr[vec_idx] = out_vec.f4;
+        } else {
+            // Write Meta (Max, Sum)
+            if (vec_idx == 0) {
+                 int meta_idx = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * 2;
+                 temp_meta[meta_idx] = global_m;
+                 temp_meta[meta_idx + 1] = global_sum_l;
+            }
+            // Write Acc
+            int acc_offset = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * HEAD_SIZE + vec_idx * 8;
+            #pragma unroll
+            for(int i=0; i<8; ++i) temp_acc[acc_offset + i] = acc[i];
+        }
+    }
+}
+
+// --- Merge Kernel ---
+template<int HEAD_SIZE>
+__global__ void split_merge_kernel(
+    hip_bfloat16* __restrict__ output,
+    const float* __restrict__ temp_acc,
+    const float* __restrict__ temp_meta,
+    int num_splits,
+    int num_q_heads
+) {
+    const int q_idx = blockIdx.x;
+    const int h_idx = blockIdx.y;
+    const int tid = threadIdx.x; // 0..HEAD_SIZE-1
+    
+    if (tid >= HEAD_SIZE) return;
+
+    // Load global max across splits
+    float g_max = -1e20f;
+    int base_meta = (q_idx * num_q_heads + h_idx) * num_splits;
+    
+    // Pass 1: Find Max
+    for(int s=0; s<num_splits; ++s) {
+        float m = temp_meta[(base_meta + s) * 2];
+        if (m > -1e19f) g_max = fmaxf(g_max, m);
+    }
+    
+    // Pass 2: Accumulate
+    float g_sum = 0.0f;
+    float final_val = 0.0f;
+    
+    int base_acc = (q_idx * num_q_heads + h_idx) * num_splits * HEAD_SIZE;
+
+    for(int s=0; s<num_splits; ++s) {
+        float m = temp_meta[(base_meta + s) * 2];
+        float sum = temp_meta[(base_meta + s) * 2 + 1];
+        
+        if (m > -1e19f) {
+            float weight = sum * expf(m - g_max);
+            g_sum += weight;
+            
+            float val = temp_acc[base_acc + s * HEAD_SIZE + tid]; // Acc stored is unnormalized sum
+            // Acc_stored = Sum(V * exp(S - m))
+            // We want Contribution = Sum(V * exp(S - g_max))
+            // Contribution = Acc_stored * exp(m - g_max)
+            final_val += val * expf(m - g_max);
+        }
+    }
+    
+    // Write
+    int out_idx = q_idx * num_q_heads * HEAD_SIZE + h_idx * HEAD_SIZE + tid;
+    output[out_idx] = hip_bfloat16(final_val / (g_sum + 1e-6f));
+}
+
+// --- Host Function ---
+Tensor custom_paged_attn(
+    const Tensor& query, const Tensor& key_cache, const Tensor& value_cache,
+    const std::vector<int64_t>& query_lens, const std::vector<int64_t>& kv_lens,
+    Tensor block_tables, double scale, double soft_cap = -1.0
+) {
+    const int total_q = query.size(0);
+    const int num_q_heads = query.size(1);
+    const int head_size = query.size(2);
+    const int num_kv_heads = key_cache.size(2);
+    const int max_blocks_per_seq = block_tables.size(1);
+    
+    hipStream_t stream = at::hip::getCurrentHIPStream().stream();
+    Tensor output = torch::empty_like(query);
+
+    auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(query.device());
+    Tensor q_lens_gpu = torch::empty({(long)query_lens.size()}, opts_i64);
+    Tensor kv_lens_gpu = torch::empty({(long)kv_lens.size()}, opts_i64);
+    
+    hipMemcpyAsync(q_lens_gpu.data_ptr(), query_lens.data(), query_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+    hipMemcpyAsync(kv_lens_gpu.data_ptr(), kv_lens.data(), kv_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+
+    // Dynamic Split Heuristic
+    // If small batch (Total Q < 64) and Long Context (avg > 512), use Split-K
+    // MI250 GCD has ~110 CUs. Target > 256 Blocks.
+    // If Grid < 128, try to split.
+    int avg_kv_len = 0;
+    if (kv_lens.size() > 0) avg_kv_len = kv_lens[0]; // Approx
+    
+    int num_splits = 1;
+    int blocks_needed = total_q * num_q_heads;
+    
+    if (blocks_needed < 256 && avg_kv_len > 512) {
+        num_splits = 256 / blocks_needed;
+        if (num_splits > 8) num_splits = 8; // Cap splits
+        if (num_splits < 1) num_splits = 1;
+    }
+
+    Tensor temp_acc, temp_meta;
+    if (num_splits > 1) {
+        auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
+        temp_acc = torch::empty({total_q, num_q_heads, num_splits, head_size}, opts_f32);
+        temp_meta = torch::empty({total_q, num_q_heads, num_splits, 2}, opts_f32);
+    } else {
+        // Dummy tensors to satisfy reference (ptr will be nullptr/unused)
+        temp_acc = torch::empty({0}, query.options());
+        temp_meta = torch::empty({0}, query.options());
+    }
+
+    dim3 grid(total_q, num_q_heads, num_splits);
+    dim3 block(WARP_SIZE);
+    
+    #define LAUNCH_KERNEL(HEAD_SIZE) \
+        paged_attn_kernel_opt<HEAD_SIZE, 16><<<grid, block, 0, stream>>>( \
+            (hip_bfloat16*)output.data_ptr(), \
+            num_splits > 1 ? temp_acc.data_ptr<float>() : nullptr, \
+            num_splits > 1 ? temp_meta.data_ptr<float>() : nullptr, \
+            (hip_bfloat16*)query.data_ptr(), \
+            (hip_bfloat16*)key_cache.data_ptr(), \
+            (hip_bfloat16*)value_cache.data_ptr(), \
+            block_tables.data_ptr<int>(), \
+            kv_lens_gpu.data_ptr<int64_t>(), \
+            q_lens_gpu.data_ptr<int64_t>(), \
+            (float)scale, \
+            max_blocks_per_seq, \
+            query.stride(0), query.stride(1), \
+            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), \
+            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), \
+            num_kv_heads, \
+            num_splits \
+        ); \
+        if (num_splits > 1) { \
+            dim3 merge_grid(total_q, num_q_heads); \
+            dim3 merge_block(HEAD_SIZE); \
+            split_merge_kernel<HEAD_SIZE><<<merge_grid, merge_block, 0, stream>>>( \
+                (hip_bfloat16*)output.data_ptr(), \
+                temp_acc.data_ptr<float>(), \
+                temp_meta.data_ptr<float>(), \
+                num_splits, \
+                num_q_heads \
+            ); \
+        }
+
+    switch (head_size) {
+        case 64: LAUNCH_KERNEL(64); break;
+        case 128: LAUNCH_KERNEL(128); break;
+        case 256: LAUNCH_KERNEL(256); break;
+    }
+
+    return output;
+}
+
+PYBIND11_MODULE(custom_attn, m) {
+    m.def("custom_paged_attn", &custom_paged_attn, "Optimized Paged Attention V3 (Hybrid Split-K)");
+}
+
+
+
+
+
+
+#include <torch/torch.h>
+#include <ATen/hip/HIPContext.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
+#include <vector>
+#include <cmath>
+
+using torch::Tensor;
+
+#define WARP_SIZE 64
+
+// Structure for vectorized load (16 bytes = 128 bits)
+struct alignas(16) Vec128 {
+    union {
+        float4 f4;
+        hip_bfloat16 bf16[8];
+    };
+};
+
+// --- Helper Functions ---
+
+__device__ __forceinline__ float vec_dot(const Vec128& a, const Vec128& b) {
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sum += static_cast<float>(a.bf16[i]) * static_cast<float>(b.bf16[i]);
+    }
+    return sum;
+}
+
+// --- Main Kernel ---
+template<int HEAD_SIZE, int BLOCK_SIZE>
+__global__ void paged_attn_kernel_opt(
+    hip_bfloat16* __restrict__ output,
+    float* __restrict__ temp_acc,      
+    float* __restrict__ temp_meta,     
+    const hip_bfloat16* __restrict__ q,
+    const hip_bfloat16* __restrict__ k_cache,
+    const hip_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ block_tables,
+    const int64_t* __restrict__ kv_lens,
+    const int64_t* __restrict__ q_lens,
+    const float scale,
+    const int max_num_blocks_per_seq,
+    const int q_stride_0, const int q_stride_1,
+    const int k_stride_block, const int k_stride_token, const int k_stride_head,
+    const int v_stride_block, const int v_stride_token, const int v_stride_head,
+    const int num_kv_heads,
+    const int num_splits
+) {
+    const int q_token_global_idx = blockIdx.x; 
+    const int head_idx = blockIdx.y;
+    const int split_idx = blockIdx.z;
+
+    // --- 1. Metadata Loading ---
+    // Fast Scan for Sequence ID
+    int local_seq_idx = 0;
+    int current_q_start = 0;
+    int q_len_val = 0;
+    
+    if (gridDim.x > 1) {
+       int limit = gridDim.x; 
+       for(int i=0; i < limit; ++i) {
+           int len = (int)q_lens[i];
+           if (q_token_global_idx < current_q_start + len) {
+               local_seq_idx = i;
+               q_len_val = len;
+               break;
+           }
+           current_q_start += len;
+       }
+    } else {
+       q_len_val = (int)q_lens[0];
+    }
+    
+    const int kv_len = (int)kv_lens[local_seq_idx];
+    const int q_pos_in_seq = q_token_global_idx - current_q_start;
+    const int num_q_heads = gridDim.y;
+    const int group_size = num_q_heads / num_kv_heads; 
+    const int kv_head_idx = head_idx / group_size;
+
+    // --- 2. Range Calculation (Split-K) ---
+    const int total_logical_blocks = (kv_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int blocks_per_split = (total_logical_blocks + num_splits - 1) / num_splits;
+    const int start_blk = split_idx * blocks_per_split;
+    const int end_blk = min(start_blk + blocks_per_split, total_logical_blocks);
+    
+    // Init for empty split
+    if (start_blk >= end_blk) {
+        if (num_splits > 1 && threadIdx.x == 0) {
+            int meta_idx = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * 2;
+            temp_meta[meta_idx] = -1e20f;     
+            temp_meta[meta_idx + 1] = 0.0f;   
+        }
+        return;
+    }
+
+    // --- 3. Load Q (Vectorized) ---
+    const int VECS_PER_HEAD = HEAD_SIZE / 8;
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+
+    Vec128 q_vec;
+    #pragma unroll
+    for(int i=0; i<8; ++i) q_vec.bf16[i] = hip_bfloat16(0.0f);
+
+    if (tid < VECS_PER_HEAD) {
+        const float4* q_ptr_f4 = reinterpret_cast<const float4*>(
+            q + q_token_global_idx * q_stride_0 + head_idx * q_stride_1
+        );
+        q_vec.f4 = q_ptr_f4[tid];
+        #pragma unroll
+        for(int i=0; i<8; ++i) {
+             float val = static_cast<float>(q_vec.bf16[i]);
+             q_vec.bf16[i] = hip_bfloat16(val * scale);
+        }
+    }
+    // Warp Broadcast Q
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float val = static_cast<float>(q_vec.bf16[i]);
+        val = __shfl(val, lane_id % VECS_PER_HEAD, WARP_SIZE);
+        q_vec.bf16[i] = hip_bfloat16(val);
+    }
+    
+    // --- 4. Main Computation Loop ---
+    float m_i = -1e20f; 
+    float l_i = 0.0f;   
+    float acc[8] = {0.0f};
+
+    constexpr int TOKENS_PER_WARP = WARP_SIZE / VECS_PER_HEAD;
+    const int token_idx_in_group = tid / VECS_PER_HEAD; 
+    const int vec_idx = tid % VECS_PER_HEAD;
+    const int* my_block_table = block_tables + local_seq_idx * max_num_blocks_per_seq;
+    
+    // Determine the safe range (Full Blocks) vs Unsafe (Last Block)
+    // The last logical block of the sequence needs bounds checking.
+    // All blocks before that are GUARANTEED to be full (BLOCK_SIZE tokens).
+    // Note: split range [start_blk, end_blk). 
+    // Is end_blk the absolutely last block of sequence? 
+    // Only if end_blk == total_logical_blocks.
+    
+    int loop_end_safe = end_blk;
+    if (end_blk == total_logical_blocks) {
+        loop_end_safe = end_blk - 1;
+    }
+
+    // --- FAST LOOP (No If Check) ---
+    // Iterate over full blocks
+    if (start_blk < loop_end_safe) {
+        for (int blk_idx = start_blk; blk_idx < loop_end_safe; ++blk_idx) {
+            const int phys_block = my_block_table[blk_idx];
+            
+            // Unroll over tokens in block
+            #pragma unroll
+            for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+                int current_token_off = t + token_idx_in_group;
+                
+                // NO BOUNDS CHECK NEEDED HERE -> Pure Compute
+                
+                // Load K
+                long long k_offset = (long long)phys_block * k_stride_block + (long long)current_token_off * k_stride_token + (long long)kv_head_idx * k_stride_head;
+                const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+                Vec128 k_vec; k_vec.f4 = k_ptr[vec_idx];
+
+                // Load V (Prefetch-ish: Load V right after K to hide latency)
+                long long v_offset = (long long)phys_block * v_stride_block + (long long)current_token_off * v_stride_token + (long long)kv_head_idx * v_stride_head;
+                const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+                Vec128 v_vec; v_vec.f4 = v_ptr[vec_idx];
+
+                // Compute Dot
+                float score = vec_dot(q_vec, k_vec);
+                
+                // Reduce Score within group
+                #pragma unroll
+                for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) 
+                    score += __shfl_xor(score, offset, WARP_SIZE);
+                
+                // Broadcast Score to all (lane 0 has the sum)
+                score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+                
+                // Online Softmax
+                float m_prev = m_i;
+                m_i = fmaxf(m_i, score);
+                float exp_score = expf(score - m_i);
+                float correction = expf(m_prev - m_i);
+                l_i = l_i * correction + exp_score;
+                
+                // Accumulate V
+                #pragma unroll
+                for(int i=0; i<8; ++i) 
+                    acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+            }
+        }
+    }
+
+    // --- REMAINDER LOOP (With Check) ---
+    // Process the last block if it belongs to this split
+    if (end_blk == total_logical_blocks && start_blk < total_logical_blocks) {
+        int blk_idx = total_logical_blocks - 1;
+        const int phys_block = my_block_table[blk_idx];
+        const int causal_limit = kv_len - q_len_val + q_pos_in_seq;
+
+        for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+            int current_token_off = t + token_idx_in_group;
+            int global_kv_idx = blk_idx * BLOCK_SIZE + current_token_off;
+            
+            // Bounds Check
+            bool active = (current_token_off < BLOCK_SIZE) && (global_kv_idx < kv_len) && (global_kv_idx <= causal_limit);
+            if (!active) continue;
+
+            // Load K
+            long long k_offset = (long long)phys_block * k_stride_block + (long long)current_token_off * k_stride_token + (long long)kv_head_idx * k_stride_head;
+            const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+            Vec128 k_vec; k_vec.f4 = k_ptr[vec_idx];
+
+            float score = vec_dot(q_vec, k_vec);
+            #pragma unroll
+            for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) score += __shfl_xor(score, offset, WARP_SIZE);
+            
+            long long v_offset = (long long)phys_block * v_stride_block + (long long)current_token_off * v_stride_token + (long long)kv_head_idx * v_stride_head;
+            const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+            Vec128 v_vec; v_vec.f4 = v_ptr[vec_idx]; 
+            
+            score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+            
+            float m_prev = m_i;
+            m_i = fmaxf(m_i, score);
+            float exp_score = expf(score - m_i);
+            float correction = expf(m_prev - m_i);
+            l_i = l_i * correction + exp_score;
+            
+            #pragma unroll
+            for(int i=0; i<8; ++i) acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+        }
+    }
+
+    // --- 5. Warp Reduction ---
+    float global_m = m_i;
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) 
+        global_m = fmaxf(global_m, __shfl_xor(global_m, offset, WARP_SIZE));
+    
+    float correction_factor = expf(m_i - global_m);
+    float l_corrected = l_i * correction_factor;
+    float global_sum_l = l_corrected;
+    
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) 
+        global_sum_l += __shfl_xor(global_sum_l, offset, WARP_SIZE);
+    
+    #pragma unroll
+    for(int i=0; i<8; ++i) acc[i] *= correction_factor;
+    #pragma unroll
+    for(int i=0; i<8; ++i) {
+        #pragma unroll
+        for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) 
+            acc[i] += __shfl_xor(acc[i], offset, WARP_SIZE);
+    }
+    
+    // --- 6. Write Output ---
+    if (token_idx_in_group == 0 && vec_idx < VECS_PER_HEAD) {
+        if (num_splits == 1) {
+            float inv_sum = 1.0f / (global_sum_l + 1e-6f);
+            float4* out_ptr = reinterpret_cast<float4*>(output + q_token_global_idx * num_q_heads * HEAD_SIZE + head_idx * HEAD_SIZE);
+            Vec128 out_vec;
+            #pragma unroll
+            for(int i=0; i<8; ++i) out_vec.bf16[i] = hip_bfloat16(acc[i] * inv_sum);
+            out_ptr[vec_idx] = out_vec.f4;
+        } else {
+            if (vec_idx == 0) {
+                 int meta_idx = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * 2;
+                 temp_meta[meta_idx] = global_m;
+                 temp_meta[meta_idx + 1] = global_sum_l;
+            }
+            int acc_offset = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * HEAD_SIZE + vec_idx * 8;
+            #pragma unroll
+            for(int i=0; i<8; ++i) temp_acc[acc_offset + i] = acc[i];
+        }
+    }
+}
+
+// --- Merge Kernel ---
+template<int HEAD_SIZE>
+__global__ void split_merge_kernel(
+    hip_bfloat16* __restrict__ output,
+    const float* __restrict__ temp_acc,
+    const float* __restrict__ temp_meta,
+    int num_splits,
+    int num_q_heads
+) {
+    const int q_idx = blockIdx.x;
+    const int h_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+    
+    if (tid >= HEAD_SIZE) return;
+
+    float g_max = -1e20f;
+    int base_meta = (q_idx * num_q_heads + h_idx) * num_splits;
+    
+    for(int s=0; s<num_splits; ++s) {
+        float m = temp_meta[(base_meta + s) * 2];
+        if (m > -1e19f) g_max = fmaxf(g_max, m);
+    }
+    
+    float g_sum = 0.0f;
+    float final_val = 0.0f;
+    int base_acc = (q_idx * num_q_heads + h_idx) * num_splits * HEAD_SIZE;
+
+    for(int s=0; s<num_splits; ++s) {
+        float m = temp_meta[(base_meta + s) * 2];
+        float sum = temp_meta[(base_meta + s) * 2 + 1];
+        
+        if (m > -1e19f) {
+            float weight = sum * expf(m - g_max);
+            g_sum += weight;
+            float val = temp_acc[base_acc + s * HEAD_SIZE + tid];
+            final_val += val * expf(m - g_max);
+        }
+    }
+    
+    int out_idx = q_idx * num_q_heads * HEAD_SIZE + h_idx * HEAD_SIZE + tid;
+    output[out_idx] = hip_bfloat16(final_val / (g_sum + 1e-6f));
+}
+
+// --- Host Function ---
+Tensor custom_paged_attn(
+    const Tensor& query, const Tensor& key_cache, const Tensor& value_cache,
+    const std::vector<int64_t>& query_lens, const std::vector<int64_t>& kv_lens,
+    Tensor block_tables, double scale, double soft_cap = -1.0
+) {
+    const int total_q = query.size(0);
+    const int num_q_heads = query.size(1);
+    const int head_size = query.size(2);
+    const int num_kv_heads = key_cache.size(2);
+    const int max_blocks_per_seq = block_tables.size(1);
+    
+    hipStream_t stream = at::hip::getCurrentHIPStream().stream();
+    // FIX: Using torch::empty instead of empty_like (forbidden)
+    Tensor output = torch::empty(query.sizes(), query.options());
+
+    auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(query.device());
+    Tensor q_lens_gpu = torch::empty({(long)query_lens.size()}, opts_i64);
+    Tensor kv_lens_gpu = torch::empty({(long)kv_lens.size()}, opts_i64);
+    
+    hipMemcpyAsync(q_lens_gpu.data_ptr(), query_lens.data(), query_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+    hipMemcpyAsync(kv_lens_gpu.data_ptr(), kv_lens.data(), kv_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+
+    // Dynamic Split Heuristic
+    int avg_kv_len = 0;
+    if (kv_lens.size() > 0) avg_kv_len = kv_lens[0]; 
+    
+    int num_splits = 1;
+    int blocks_needed = total_q * num_q_heads;
+    
+    if (blocks_needed < 256 && avg_kv_len > 512) {
+        num_splits = 256 / blocks_needed;
+        if (num_splits > 8) num_splits = 8;
+        if (num_splits < 1) num_splits = 1;
+    }
+
+    Tensor temp_acc, temp_meta;
+    if (num_splits > 1) {
+        auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
+        temp_acc = torch::empty({total_q, num_q_heads, num_splits, head_size}, opts_f32);
+        temp_meta = torch::empty({total_q, num_q_heads, num_splits, 2}, opts_f32);
+    } else {
+        temp_acc = torch::empty({0}, query.options());
+        temp_meta = torch::empty({0}, query.options());
+    }
+
+    dim3 grid(total_q, num_q_heads, num_splits);
+    dim3 block(WARP_SIZE);
+    
+    #define LAUNCH_KERNEL(HEAD_SIZE) \
+        paged_attn_kernel_opt<HEAD_SIZE, 16><<<grid, block, 0, stream>>>( \
+            (hip_bfloat16*)output.data_ptr(), \
+            num_splits > 1 ? temp_acc.data_ptr<float>() : nullptr, \
+            num_splits > 1 ? temp_meta.data_ptr<float>() : nullptr, \
+            (hip_bfloat16*)query.data_ptr(), \
+            (hip_bfloat16*)key_cache.data_ptr(), \
+            (hip_bfloat16*)value_cache.data_ptr(), \
+            block_tables.data_ptr<int>(), \
+            kv_lens_gpu.data_ptr<int64_t>(), \
+            q_lens_gpu.data_ptr<int64_t>(), \
+            (float)scale, \
+            max_blocks_per_seq, \
+            query.stride(0), query.stride(1), \
+            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), \
+            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), \
+            num_kv_heads, \
+            num_splits \
+        ); \
+        if (num_splits > 1) { \
+            dim3 merge_grid(total_q, num_q_heads); \
+            dim3 merge_block(HEAD_SIZE); \
+            split_merge_kernel<HEAD_SIZE><<<merge_grid, merge_block, 0, stream>>>( \
+                (hip_bfloat16*)output.data_ptr(), \
+                temp_acc.data_ptr<float>(), \
+                temp_meta.data_ptr<float>(), \
+                num_splits, \
+                num_q_heads \
+            ); \
+        }
+
+    switch (head_size) {
+        case 64: LAUNCH_KERNEL(64); break;
+        case 128: LAUNCH_KERNEL(128); break;
+        case 256: LAUNCH_KERNEL(256); break;
+    }
+
+    return output;
+}
+
+PYBIND11_MODULE(custom_attn, m) {
+    m.def("custom_paged_attn", &custom_paged_attn, "Optimized Paged Attention V4 (FastPath + Safe)");
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#include <torch/torch.h>
+#include <ATen/hip/HIPContext.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
+#include <vector>
+#include <cmath>
+
+using torch::Tensor;
+
+#define WARP_SIZE 64
+
+struct alignas(16) Vec128 {
+    union {
+        float4 f4;
+        hip_bfloat16 bf16[8];
+    };
+};
+
+__device__ __forceinline__ float vec_dot(const Vec128& a, const Vec128& b) {
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sum += static_cast<float>(a.bf16[i]) * static_cast<float>(b.bf16[i]);
+    }
+    return sum;
+}
+
+// --- Main Kernel ---
+template<int HEAD_SIZE, int BLOCK_SIZE>
+__global__ void paged_attn_kernel_opt(
+    hip_bfloat16* __restrict__ output,
+    float* __restrict__ temp_acc,      
+    float* __restrict__ temp_meta,     
+    const hip_bfloat16* __restrict__ q,
+    const hip_bfloat16* __restrict__ k_cache,
+    const hip_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ block_tables,
+    const int64_t* __restrict__ kv_lens,
+    const int64_t* __restrict__ q_lens,
+    const float scale,
+    const int max_num_blocks_per_seq,
+    const int q_stride_0, const int q_stride_1,
+    const int k_stride_block, const int k_stride_token, const int k_stride_head,
+    const int v_stride_block, const int v_stride_token, const int v_stride_head,
+    const int num_kv_heads,
+    const int num_splits
+) {
+    const int q_token_global_idx = blockIdx.x; 
+    const int head_idx = blockIdx.y;
+    const int split_idx = blockIdx.z;
+
+    // --- 1. Metadata ---
+    int local_seq_idx = 0;
+    int current_q_start = 0;
+    int q_len_val = 0;
+    
+    if (gridDim.x > 1) {
+       int limit = gridDim.x; 
+       for(int i=0; i < limit; ++i) {
+           int len = (int)q_lens[i];
+           if (q_token_global_idx < current_q_start + len) {
+               local_seq_idx = i;
+               q_len_val = len;
+               break;
+           }
+           current_q_start += len;
+       }
+    } else {
+       q_len_val = (int)q_lens[0];
+    }
+    
+    const int kv_len = (int)kv_lens[local_seq_idx];
+    const int q_pos_in_seq = q_token_global_idx - current_q_start;
+    const int num_q_heads = gridDim.y;
+    const int group_size = num_q_heads / num_kv_heads; 
+    const int kv_head_idx = head_idx / group_size;
+
+    // --- 2. Split Range ---
+    const int total_logical_blocks = (kv_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int blocks_per_split = (total_logical_blocks + num_splits - 1) / num_splits;
+    const int start_blk = split_idx * blocks_per_split;
+    const int end_blk = min(start_blk + blocks_per_split, total_logical_blocks);
+    
+    if (start_blk >= end_blk) {
+        if (num_splits > 1 && threadIdx.x == 0) {
+            int meta_idx = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * 2;
+            temp_meta[meta_idx] = -1e20f;     
+            temp_meta[meta_idx + 1] = 0.0f;   
+        }
+        return;
+    }
+
+    // --- 3. Load Q ---
+    const int VECS_PER_HEAD = HEAD_SIZE / 8;
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+
+    Vec128 q_vec;
+    #pragma unroll
+    for(int i=0; i<8; ++i) q_vec.bf16[i] = hip_bfloat16(0.0f);
+
+    if (tid < VECS_PER_HEAD) {
+        const float4* q_ptr_f4 = reinterpret_cast<const float4*>(
+            q + q_token_global_idx * q_stride_0 + head_idx * q_stride_1
+        );
+        q_vec.f4 = q_ptr_f4[tid];
+        #pragma unroll
+        for(int i=0; i<8; ++i) {
+             float val = static_cast<float>(q_vec.bf16[i]);
+             q_vec.bf16[i] = hip_bfloat16(val * scale);
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float val = static_cast<float>(q_vec.bf16[i]);
+        val = __shfl(val, lane_id % VECS_PER_HEAD, WARP_SIZE);
+        q_vec.bf16[i] = hip_bfloat16(val);
+    }
+    
+    // --- 4. Main Loop ---
+    float m_i = -1e20f; 
+    float l_i = 0.0f;   
+    float acc[8] = {0.0f};
+
+    constexpr int TOKENS_PER_WARP = WARP_SIZE / VECS_PER_HEAD;
+    const int token_idx_in_group = tid / VECS_PER_HEAD; 
+    const int vec_idx = tid % VECS_PER_HEAD;
+    const int* my_block_table = block_tables + local_seq_idx * max_num_blocks_per_seq;
+    const int causal_limit = kv_len - q_len_val + q_pos_in_seq;
+
+    // STRATEGY SWITCH:
+    // H128 -> FastPath (Duplicate Loops) for max speed.
+    // H256 -> Compact Loop (Single Loop) to save registers/ICache.
+    
+    if constexpr (HEAD_SIZE <= 128) {
+        // === STRATEGY A: FAST PATH (Code Bloat but Fast for small heads) ===
+        int loop_end_safe = end_blk;
+        if (end_blk == total_logical_blocks) loop_end_safe = end_blk - 1;
+
+        // Safe Loop
+        if (start_blk < loop_end_safe) {
+            for (int blk_idx = start_blk; blk_idx < loop_end_safe; ++blk_idx) {
+                const int phys_block = my_block_table[blk_idx];
+                #pragma unroll
+                for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+                    int current_token_off = t + token_idx_in_group;
+                    // No bounds check
+                    long long k_offset = (long long)phys_block * k_stride_block + (long long)current_token_off * k_stride_token + (long long)kv_head_idx * k_stride_head;
+                    const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+                    Vec128 k_vec; k_vec.f4 = k_ptr[vec_idx];
+
+                    long long v_offset = (long long)phys_block * v_stride_block + (long long)current_token_off * v_stride_token + (long long)kv_head_idx * v_stride_head;
+                    const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+                    Vec128 v_vec; v_vec.f4 = v_ptr[vec_idx];
+
+                    float score = vec_dot(q_vec, k_vec);
+                    #pragma unroll
+                    for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) score += __shfl_xor(score, offset, WARP_SIZE);
+                    score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+                    
+                    float m_prev = m_i;
+                    m_i = fmaxf(m_i, score);
+                    float exp_score = expf(score - m_i);
+                    float correction = expf(m_prev - m_i);
+                    l_i = l_i * correction + exp_score;
+                    #pragma unroll
+                    for(int i=0; i<8; ++i) acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+                }
+            }
+        }
+        // Remainder Loop
+        if (end_blk == total_logical_blocks && start_blk < total_logical_blocks) {
+            int blk_idx = total_logical_blocks - 1;
+            const int phys_block = my_block_table[blk_idx];
+            for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+                int current_token_off = t + token_idx_in_group;
+                int global_kv_idx = blk_idx * BLOCK_SIZE + current_token_off;
+                bool active = (current_token_off < BLOCK_SIZE) && (global_kv_idx < kv_len) && (global_kv_idx <= causal_limit);
+                if (!active) continue;
+
+                long long k_offset = (long long)phys_block * k_stride_block + (long long)current_token_off * k_stride_token + (long long)kv_head_idx * k_stride_head;
+                const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+                Vec128 k_vec; k_vec.f4 = k_ptr[vec_idx];
+
+                float score = vec_dot(q_vec, k_vec);
+                #pragma unroll
+                for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) score += __shfl_xor(score, offset, WARP_SIZE);
+                
+                long long v_offset = (long long)phys_block * v_stride_block + (long long)current_token_off * v_stride_token + (long long)kv_head_idx * v_stride_head;
+                const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+                Vec128 v_vec; v_vec.f4 = v_ptr[vec_idx]; 
+                score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+                float m_prev = m_i;
+                m_i = fmaxf(m_i, score);
+                float exp_score = expf(score - m_i);
+                float correction = expf(m_prev - m_i);
+                l_i = l_i * correction + exp_score;
+                #pragma unroll
+                for(int i=0; i<8; ++i) acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+            }
+        }
+    } else {
+        // === STRATEGY B: COMPACT LOOP (H256) ===
+        // Less code size, less unrolling to prevent register spilling
+        for (int blk_idx = start_blk; blk_idx < end_blk; ++blk_idx) {
+            const int phys_block = my_block_table[blk_idx];
+            
+            // Limit unrolling for H256 to avoid instruction explosion
+            #pragma unroll 2 
+            for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+                int current_token_off = t + token_idx_in_group;
+                int global_kv_idx = blk_idx * BLOCK_SIZE + current_token_off;
+                
+                // Include check inside
+                bool active = (current_token_off < BLOCK_SIZE) && (global_kv_idx < kv_len) && (global_kv_idx <= causal_limit);
+                if (!active) continue;
+
+                long long k_offset = (long long)phys_block * k_stride_block + (long long)current_token_off * k_stride_token + (long long)kv_head_idx * k_stride_head;
+                const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+                Vec128 k_vec; k_vec.f4 = k_ptr[vec_idx];
+
+                float score = vec_dot(q_vec, k_vec);
+                #pragma unroll
+                for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) score += __shfl_xor(score, offset, WARP_SIZE);
+                
+                long long v_offset = (long long)phys_block * v_stride_block + (long long)current_token_off * v_stride_token + (long long)kv_head_idx * v_stride_head;
+                const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+                Vec128 v_vec; v_vec.f4 = v_ptr[vec_idx]; 
+
+                score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+                
+                float m_prev = m_i;
+                m_i = fmaxf(m_i, score);
+                float exp_score = expf(score - m_i);
+                float correction = expf(m_prev - m_i);
+                l_i = l_i * correction + exp_score;
+                
+                #pragma unroll
+                for(int i=0; i<8; ++i) acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+            }
+        }
+    }
+
+    // --- 5. Reduction ---
+    float global_m = m_i;
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) 
+        global_m = fmaxf(global_m, __shfl_xor(global_m, offset, WARP_SIZE));
+    
+    float correction_factor = expf(m_i - global_m);
+    float l_corrected = l_i * correction_factor;
+    float global_sum_l = l_corrected;
+    
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) 
+        global_sum_l += __shfl_xor(global_sum_l, offset, WARP_SIZE);
+    
+    #pragma unroll
+    for(int i=0; i<8; ++i) acc[i] *= correction_factor;
+    #pragma unroll
+    for(int i=0; i<8; ++i) {
+        #pragma unroll
+        for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) 
+            acc[i] += __shfl_xor(acc[i], offset, WARP_SIZE);
+    }
+    
+    // --- 6. Output ---
+    if (token_idx_in_group == 0 && vec_idx < VECS_PER_HEAD) {
+        if (num_splits == 1) {
+            float inv_sum = 1.0f / (global_sum_l + 1e-6f);
+            float4* out_ptr = reinterpret_cast<float4*>(output + q_token_global_idx * num_q_heads * HEAD_SIZE + head_idx * HEAD_SIZE);
+            Vec128 out_vec;
+            #pragma unroll
+            for(int i=0; i<8; ++i) out_vec.bf16[i] = hip_bfloat16(acc[i] * inv_sum);
+            out_ptr[vec_idx] = out_vec.f4;
+        } else {
+            if (vec_idx == 0) {
+                 int meta_idx = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * 2;
+                 temp_meta[meta_idx] = global_m;
+                 temp_meta[meta_idx + 1] = global_sum_l;
+            }
+            int acc_offset = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * HEAD_SIZE + vec_idx * 8;
+            #pragma unroll
+            for(int i=0; i<8; ++i) temp_acc[acc_offset + i] = acc[i];
+        }
+    }
+}
+
+// --- Merge Kernel ---
+template<int HEAD_SIZE>
+__global__ void split_merge_kernel(
+    hip_bfloat16* __restrict__ output,
+    const float* __restrict__ temp_acc,
+    const float* __restrict__ temp_meta,
+    int num_splits,
+    int num_q_heads
+) {
+    const int q_idx = blockIdx.x;
+    const int h_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+    
+    if (tid >= HEAD_SIZE) return;
+
+    float g_max = -1e20f;
+    int base_meta = (q_idx * num_q_heads + h_idx) * num_splits;
+    
+    for(int s=0; s<num_splits; ++s) {
+        float m = temp_meta[(base_meta + s) * 2];
+        if (m > -1e19f) g_max = fmaxf(g_max, m);
+    }
+    
+    float g_sum = 0.0f;
+    float final_val = 0.0f;
+    int base_acc = (q_idx * num_q_heads + h_idx) * num_splits * HEAD_SIZE;
+
+    for(int s=0; s<num_splits; ++s) {
+        float m = temp_meta[(base_meta + s) * 2];
+        float sum = temp_meta[(base_meta + s) * 2 + 1];
+        
+        if (m > -1e19f) {
+            float weight = sum * expf(m - g_max);
+            g_sum += weight;
+            float val = temp_acc[base_acc + s * HEAD_SIZE + tid];
+            final_val += val * expf(m - g_max);
+        }
+    }
+    
+    int out_idx = q_idx * num_q_heads * HEAD_SIZE + h_idx * HEAD_SIZE + tid;
+    output[out_idx] = hip_bfloat16(final_val / (g_sum + 1e-6f));
+}
+
+// --- Host Function ---
+Tensor custom_paged_attn(
+    const Tensor& query, const Tensor& key_cache, const Tensor& value_cache,
+    const std::vector<int64_t>& query_lens, const std::vector<int64_t>& kv_lens,
+    Tensor block_tables, double scale, double soft_cap = -1.0
+) {
+    const int total_q = query.size(0);
+    const int num_q_heads = query.size(1);
+    const int head_size = query.size(2);
+    const int num_kv_heads = key_cache.size(2);
+    const int max_blocks_per_seq = block_tables.size(1);
+    
+    hipStream_t stream = at::hip::getCurrentHIPStream().stream();
+    Tensor output = torch::empty(query.sizes(), query.options());
+
+    auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(query.device());
+    Tensor q_lens_gpu = torch::empty({(long)query_lens.size()}, opts_i64);
+    Tensor kv_lens_gpu = torch::empty({(long)kv_lens.size()}, opts_i64);
+    
+    hipMemcpyAsync(q_lens_gpu.data_ptr(), query_lens.data(), query_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+    hipMemcpyAsync(kv_lens_gpu.data_ptr(), kv_lens.data(), kv_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+
+    // Optimized Split Heuristic for H256
+    int avg_kv_len = 0;
+    if (kv_lens.size() > 0) avg_kv_len = kv_lens[0]; 
+    
+    int num_splits = 1;
+    int blocks_needed = total_q * num_q_heads;
+    
+    // Aggressive splitting for H256 to handle heavy load
+    int target_blocks = (head_size >= 256) ? 512 : 256; 
+    
+    if (blocks_needed < target_blocks && avg_kv_len > 512) {
+        num_splits = target_blocks / blocks_needed;
+        if (num_splits > 8) num_splits = 8;
+        if (num_splits < 1) num_splits = 1;
+    }
+
+    Tensor temp_acc, temp_meta;
+    if (num_splits > 1) {
+        auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
+        temp_acc = torch::empty({total_q, num_q_heads, num_splits, head_size}, opts_f32);
+        temp_meta = torch::empty({total_q, num_q_heads, num_splits, 2}, opts_f32);
+    } else {
+        temp_acc = torch::empty({0}, query.options());
+        temp_meta = torch::empty({0}, query.options());
+    }
+
+    dim3 grid(total_q, num_q_heads, num_splits);
+    dim3 block(WARP_SIZE);
+    
+    #define LAUNCH_KERNEL(HEAD_SIZE) \
+        paged_attn_kernel_opt<HEAD_SIZE, 16><<<grid, block, 0, stream>>>( \
+            (hip_bfloat16*)output.data_ptr(), \
+            num_splits > 1 ? temp_acc.data_ptr<float>() : nullptr, \
+            num_splits > 1 ? temp_meta.data_ptr<float>() : nullptr, \
+            (hip_bfloat16*)query.data_ptr(), \
+            (hip_bfloat16*)key_cache.data_ptr(), \
+            (hip_bfloat16*)value_cache.data_ptr(), \
+            block_tables.data_ptr<int>(), \
+            kv_lens_gpu.data_ptr<int64_t>(), \
+            q_lens_gpu.data_ptr<int64_t>(), \
+            (float)scale, \
+            max_blocks_per_seq, \
+            query.stride(0), query.stride(1), \
+            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), \
+            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), \
+            num_kv_heads, \
+            num_splits \
+        ); \
+        if (num_splits > 1) { \
+            dim3 merge_grid(total_q, num_q_heads); \
+            dim3 merge_block(HEAD_SIZE); \
+            split_merge_kernel<HEAD_SIZE><<<merge_grid, merge_block, 0, stream>>>( \
+                (hip_bfloat16*)output.data_ptr(), \
+                temp_acc.data_ptr<float>(), \
+                temp_meta.data_ptr<float>(), \
+                num_splits, \
+                num_q_heads \
+            ); \
+        }
+
+    switch (head_size) {
+        case 64: LAUNCH_KERNEL(64); break;
+        case 128: LAUNCH_KERNEL(128); break;
+        case 256: LAUNCH_KERNEL(256); break;
+    }
+
+    return output;
+}
+
+PYBIND11_MODULE(custom_attn, m) {
+    m.def("custom_paged_attn", &custom_paged_attn, "Optimized Paged Attention V5 (Hybrid)");
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#include <torch/torch.h>
+#include <ATen/hip/HIPContext.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
+#include <vector>
+#include <cmath>
+
+using torch::Tensor;
+
+#define WARP_SIZE 64
+
+struct alignas(16) Vec128 {
+    union {
+        float4 f4;
+        hip_bfloat16 bf16[8];
+    };
+};
+
+__device__ __forceinline__ float vec_dot(const Vec128& a, const Vec128& b) {
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sum += static_cast<float>(a.bf16[i]) * static_cast<float>(b.bf16[i]);
+    }
+    return sum;
+}
+
+// --- Main Kernel ---
+template<int HEAD_SIZE, int BLOCK_SIZE>
+__global__ void paged_attn_kernel_opt(
+    hip_bfloat16* __restrict__ output,
+    float* __restrict__ temp_acc,      
+    float* __restrict__ temp_meta,     
+    const hip_bfloat16* __restrict__ q,
+    const hip_bfloat16* __restrict__ k_cache,
+    const hip_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ block_tables,
+    const int64_t* __restrict__ kv_lens,
+    const int64_t* __restrict__ q_lens,
+    const float scale,
+    const int max_num_blocks_per_seq,
+    const int q_stride_0, const int q_stride_1,
+    const int k_stride_block, const int k_stride_token, const int k_stride_head,
+    const int v_stride_block, const int v_stride_token, const int v_stride_head,
+    const int num_kv_heads,
+    const int num_splits
+) {
+    const int q_token_global_idx = blockIdx.x; 
+    const int head_idx = blockIdx.y;
+    const int split_idx = blockIdx.z;
+
+    // --- 1. Metadata ---
+    int local_seq_idx = 0;
+    int current_q_start = 0;
+    int q_len_val = 0;
+    
+    // Fast Scan
+    if (gridDim.x > 1) {
+       int limit = gridDim.x; 
+       for(int i=0; i < limit; ++i) {
+           int len = (int)q_lens[i];
+           if (q_token_global_idx < current_q_start + len) {
+               local_seq_idx = i;
+               q_len_val = len;
+               break;
+           }
+           current_q_start += len;
+       }
+    } else {
+       q_len_val = (int)q_lens[0];
+    }
+    
+    const int kv_len = (int)kv_lens[local_seq_idx];
+    const int q_pos_in_seq = q_token_global_idx - current_q_start;
+    const int num_q_heads = gridDim.y;
+    const int group_size = num_q_heads / num_kv_heads; 
+    const int kv_head_idx = head_idx / group_size;
+
+    // --- 2. Split Range ---
+    const int total_logical_blocks = (kv_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int blocks_per_split = (total_logical_blocks + num_splits - 1) / num_splits;
+    const int start_blk = split_idx * blocks_per_split;
+    const int end_blk = min(start_blk + blocks_per_split, total_logical_blocks);
+    
+    // Empty split check
+    if (start_blk >= end_blk) {
+        if (num_splits > 1 && threadIdx.x == 0) {
+            int meta_idx = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * 2;
+            temp_meta[meta_idx] = -1e20f;     
+            temp_meta[meta_idx + 1] = 0.0f;   
+        }
+        return;
+    }
+
+    // --- 3. Load Q ---
+    const int VECS_PER_HEAD = HEAD_SIZE / 8;
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+
+    Vec128 q_vec;
+    #pragma unroll
+    for(int i=0; i<8; ++i) q_vec.bf16[i] = hip_bfloat16(0.0f);
+
+    if (tid < VECS_PER_HEAD) {
+        const float4* q_ptr_f4 = reinterpret_cast<const float4*>(
+            q + q_token_global_idx * q_stride_0 + head_idx * q_stride_1
+        );
+        q_vec.f4 = q_ptr_f4[tid];
+        #pragma unroll
+        for(int i=0; i<8; ++i) {
+             float val = static_cast<float>(q_vec.bf16[i]);
+             q_vec.bf16[i] = hip_bfloat16(val * scale);
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float val = static_cast<float>(q_vec.bf16[i]);
+        val = __shfl(val, lane_id % VECS_PER_HEAD, WARP_SIZE);
+        q_vec.bf16[i] = hip_bfloat16(val);
+    }
+    
+    // --- 4. Main Loop ---
+    float m_i = -1e20f; 
+    float l_i = 0.0f;   
+    float acc[8] = {0.0f};
+
+    constexpr int TOKENS_PER_WARP = WARP_SIZE / VECS_PER_HEAD;
+    const int token_idx_in_group = tid / VECS_PER_HEAD; 
+    const int vec_idx = tid % VECS_PER_HEAD;
+    const int* my_block_table = block_tables + local_seq_idx * max_num_blocks_per_seq;
+    const int causal_limit = kv_len - q_len_val + q_pos_in_seq;
+
+    if constexpr (HEAD_SIZE <= 128) {
+        // === STRATEGY A: FAST PATH (Unrolled + Separated Loops) for H64/H128 ===
+        int loop_end_safe = end_blk;
+        if (end_blk == total_logical_blocks) loop_end_safe = end_blk - 1;
+
+        if (start_blk < loop_end_safe) {
+            for (int blk_idx = start_blk; blk_idx < loop_end_safe; ++blk_idx) {
+                const int phys_block = my_block_table[blk_idx];
+                #pragma unroll
+                for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+                    int current_token_off = t + token_idx_in_group;
+                    
+                    long long k_offset = (long long)phys_block * k_stride_block + (long long)current_token_off * k_stride_token + (long long)kv_head_idx * k_stride_head;
+                    const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+                    Vec128 k_vec; k_vec.f4 = k_ptr[vec_idx];
+
+                    long long v_offset = (long long)phys_block * v_stride_block + (long long)current_token_off * v_stride_token + (long long)kv_head_idx * v_stride_head;
+                    const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+                    Vec128 v_vec; v_vec.f4 = v_ptr[vec_idx];
+
+                    float score = vec_dot(q_vec, k_vec);
+                    #pragma unroll
+                    for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) score += __shfl_xor(score, offset, WARP_SIZE);
+                    score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+                    
+                    float m_prev = m_i;
+                    m_i = fmaxf(m_i, score);
+                    float exp_score = expf(score - m_i);
+                    float correction = expf(m_prev - m_i);
+                    l_i = l_i * correction + exp_score;
+                    #pragma unroll
+                    for(int i=0; i<8; ++i) acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+                }
+            }
+        }
+        if (end_blk == total_logical_blocks && start_blk < total_logical_blocks) {
+            int blk_idx = total_logical_blocks - 1;
+            const int phys_block = my_block_table[blk_idx];
+            for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+                int current_token_off = t + token_idx_in_group;
+                int global_kv_idx = blk_idx * BLOCK_SIZE + current_token_off;
+                bool active = (current_token_off < BLOCK_SIZE) && (global_kv_idx < kv_len) && (global_kv_idx <= causal_limit);
+                if (!active) continue;
+                
+                long long k_offset = (long long)phys_block * k_stride_block + (long long)current_token_off * k_stride_token + (long long)kv_head_idx * k_stride_head;
+                const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+                Vec128 k_vec; k_vec.f4 = k_ptr[vec_idx];
+                
+                float score = vec_dot(q_vec, k_vec);
+                #pragma unroll
+                for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) score += __shfl_xor(score, offset, WARP_SIZE);
+                score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+                
+                long long v_offset = (long long)phys_block * v_stride_block + (long long)current_token_off * v_stride_token + (long long)kv_head_idx * v_stride_head;
+                const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+                Vec128 v_vec; v_vec.f4 = v_ptr[vec_idx]; 
+                
+                float m_prev = m_i;
+                m_i = fmaxf(m_i, score);
+                float exp_score = expf(score - m_i);
+                float correction = expf(m_prev - m_i);
+                l_i = l_i * correction + exp_score;
+                #pragma unroll
+                for(int i=0; i<8; ++i) acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+            }
+        }
+    } else {
+        // === STRATEGY B: COMPACT LOOP for H256 (Tuned) ===
+        // V6: Increased unroll from 2 to 4 to squeeze more ILP
+        for (int blk_idx = start_blk; blk_idx < end_blk; ++blk_idx) {
+            const int phys_block = my_block_table[blk_idx];
+            
+            #pragma unroll 4
+            for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+                int current_token_off = t + token_idx_in_group;
+                int global_kv_idx = blk_idx * BLOCK_SIZE + current_token_off;
+                
+                bool active = (current_token_off < BLOCK_SIZE) && (global_kv_idx < kv_len) && (global_kv_idx <= causal_limit);
+                if (!active) continue;
+
+                long long k_offset = (long long)phys_block * k_stride_block + (long long)current_token_off * k_stride_token + (long long)kv_head_idx * k_stride_head;
+                const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+                Vec128 k_vec; k_vec.f4 = k_ptr[vec_idx];
+
+                float score = vec_dot(q_vec, k_vec);
+                #pragma unroll
+                for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) score += __shfl_xor(score, offset, WARP_SIZE);
+                score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+                
+                long long v_offset = (long long)phys_block * v_stride_block + (long long)current_token_off * v_stride_token + (long long)kv_head_idx * v_stride_head;
+                const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+                Vec128 v_vec; v_vec.f4 = v_ptr[vec_idx]; 
+
+                float m_prev = m_i;
+                m_i = fmaxf(m_i, score);
+                float exp_score = expf(score - m_i);
+                float correction = expf(m_prev - m_i);
+                l_i = l_i * correction + exp_score;
+                #pragma unroll
+                for(int i=0; i<8; ++i) acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+            }
+        }
+    }
+
+    // --- 5. Reduction ---
+    float global_m = m_i;
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) 
+        global_m = fmaxf(global_m, __shfl_xor(global_m, offset, WARP_SIZE));
+    
+    float correction_factor = expf(m_i - global_m);
+    float l_corrected = l_i * correction_factor;
+    float global_sum_l = l_corrected;
+    
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) 
+        global_sum_l += __shfl_xor(global_sum_l, offset, WARP_SIZE);
+    
+    #pragma unroll
+    for(int i=0; i<8; ++i) acc[i] *= correction_factor;
+    #pragma unroll
+    for(int i=0; i<8; ++i) {
+        #pragma unroll
+        for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) 
+            acc[i] += __shfl_xor(acc[i], offset, WARP_SIZE);
+    }
+    
+    // --- 6. Output ---
+    if (token_idx_in_group == 0 && vec_idx < VECS_PER_HEAD) {
+        if (num_splits == 1) {
+            float inv_sum = 1.0f / (global_sum_l + 1e-6f);
+            float4* out_ptr = reinterpret_cast<float4*>(output + q_token_global_idx * num_q_heads * HEAD_SIZE + head_idx * HEAD_SIZE);
+            Vec128 out_vec;
+            #pragma unroll
+            for(int i=0; i<8; ++i) out_vec.bf16[i] = hip_bfloat16(acc[i] * inv_sum);
+            out_ptr[vec_idx] = out_vec.f4;
+        } else {
+            if (vec_idx == 0) {
+                 int meta_idx = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * 2;
+                 temp_meta[meta_idx] = global_m;
+                 temp_meta[meta_idx + 1] = global_sum_l;
+            }
+            int acc_offset = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * HEAD_SIZE + vec_idx * 8;
+            #pragma unroll
+            for(int i=0; i<8; ++i) temp_acc[acc_offset + i] = acc[i];
+        }
+    }
+}
+
+// --- Merge Kernel ---
+template<int HEAD_SIZE>
+__global__ void split_merge_kernel(
+    hip_bfloat16* __restrict__ output,
+    const float* __restrict__ temp_acc,
+    const float* __restrict__ temp_meta,
+    int num_splits,
+    int num_q_heads
+) {
+    const int q_idx = blockIdx.x;
+    const int h_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+    
+    if (tid >= HEAD_SIZE) return;
+
+    float g_max = -1e20f;
+    int base_meta = (q_idx * num_q_heads + h_idx) * num_splits;
+    
+    for(int s=0; s<num_splits; ++s) {
+        float m = temp_meta[(base_meta + s) * 2];
+        if (m > -1e19f) g_max = fmaxf(g_max, m);
+    }
+    
+    float g_sum = 0.0f;
+    float final_val = 0.0f;
+    int base_acc = (q_idx * num_q_heads + h_idx) * num_splits * HEAD_SIZE;
+
+    for(int s=0; s<num_splits; ++s) {
+        float m = temp_meta[(base_meta + s) * 2];
+        float sum = temp_meta[(base_meta + s) * 2 + 1];
+        
+        if (m > -1e19f) {
+            float weight = sum * expf(m - g_max);
+            g_sum += weight;
+            float val = temp_acc[base_acc + s * HEAD_SIZE + tid];
+            final_val += val * expf(m - g_max);
+        }
+    }
+    
+    int out_idx = q_idx * num_q_heads * HEAD_SIZE + h_idx * HEAD_SIZE + tid;
+    output[out_idx] = hip_bfloat16(final_val / (g_sum + 1e-6f));
+}
+
+// --- Host Function ---
+Tensor custom_paged_attn(
+    const Tensor& query, const Tensor& key_cache, const Tensor& value_cache,
+    const std::vector<int64_t>& query_lens, const std::vector<int64_t>& kv_lens,
+    Tensor block_tables, double scale, double soft_cap = -1.0
+) {
+    const int total_q = query.size(0);
+    const int num_q_heads = query.size(1);
+    const int head_size = query.size(2);
+    const int num_kv_heads = key_cache.size(2);
+    const int max_blocks_per_seq = block_tables.size(1);
+    
+    hipStream_t stream = at::hip::getCurrentHIPStream().stream();
+    Tensor output = torch::empty(query.sizes(), query.options());
+
+    auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(query.device());
+    Tensor q_lens_gpu = torch::empty({(long)query_lens.size()}, opts_i64);
+    Tensor kv_lens_gpu = torch::empty({(long)kv_lens.size()}, opts_i64);
+    
+    hipMemcpyAsync(q_lens_gpu.data_ptr(), query_lens.data(), query_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+    hipMemcpyAsync(kv_lens_gpu.data_ptr(), kv_lens.data(), kv_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+
+    // V6 Optimized Split Heuristic: AGGRESSIVE for small batches
+    int avg_kv_len = 0;
+    if (kv_lens.size() > 0) avg_kv_len = kv_lens[0]; 
+    
+    int num_splits = 1;
+    int blocks_needed = total_q * num_q_heads;
+    
+    int target_blocks = (head_size >= 256) ? 512 : 256; 
+    
+    // FIX: Lower threshold from 512 to 128 to catch small batch cases like 256
+    if (blocks_needed < target_blocks && avg_kv_len > 128) {
+        num_splits = target_blocks / blocks_needed;
+        if (num_splits > 8) num_splits = 8;
+        if (num_splits < 1) num_splits = 1;
+    }
+
+    Tensor temp_acc, temp_meta;
+    if (num_splits > 1) {
+        auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
+        temp_acc = torch::empty({total_q, num_q_heads, num_splits, head_size}, opts_f32);
+        temp_meta = torch::empty({total_q, num_q_heads, num_splits, 2}, opts_f32);
+    } else {
+        temp_acc = torch::empty({0}, query.options());
+        temp_meta = torch::empty({0}, query.options());
+    }
+
+    dim3 grid(total_q, num_q_heads, num_splits);
+    dim3 block(WARP_SIZE);
+    
+    #define LAUNCH_KERNEL(HEAD_SIZE) \
+        paged_attn_kernel_opt<HEAD_SIZE, 16><<<grid, block, 0, stream>>>( \
+            (hip_bfloat16*)output.data_ptr(), \
+            num_splits > 1 ? temp_acc.data_ptr<float>() : nullptr, \
+            num_splits > 1 ? temp_meta.data_ptr<float>() : nullptr, \
+            (hip_bfloat16*)query.data_ptr(), \
+            (hip_bfloat16*)key_cache.data_ptr(), \
+            (hip_bfloat16*)value_cache.data_ptr(), \
+            block_tables.data_ptr<int>(), \
+            kv_lens_gpu.data_ptr<int64_t>(), \
+            q_lens_gpu.data_ptr<int64_t>(), \
+            (float)scale, \
+            max_blocks_per_seq, \
+            query.stride(0), query.stride(1), \
+            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), \
+            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), \
+            num_kv_heads, \
+            num_splits \
+        ); \
+        if (num_splits > 1) { \
+            dim3 merge_grid(total_q, num_q_heads); \
+            dim3 merge_block(HEAD_SIZE); \
+            split_merge_kernel<HEAD_SIZE><<<merge_grid, merge_block, 0, stream>>>( \
+                (hip_bfloat16*)output.data_ptr(), \
+                temp_acc.data_ptr<float>(), \
+                temp_meta.data_ptr<float>(), \
+                num_splits, \
+                num_q_heads \
+            ); \
+        }
+
+    switch (head_size) {
+        case 64: LAUNCH_KERNEL(64); break;
+        case 128: LAUNCH_KERNEL(128); break;
+        case 256: LAUNCH_KERNEL(256); break;
+    }
+
+    return output;
+}
+
+PYBIND11_MODULE(custom_attn, m) {
+    m.def("custom_paged_attn", &custom_paged_attn, "Optimized Paged Attention V6 (Aggressive Occupancy)");
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#include <torch/torch.h>
+#include <ATen/hip/HIPContext.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
+#include <vector>
+#include <cmath>
+
+using torch::Tensor;
+
+#define WARP_SIZE 64
+
+struct alignas(16) Vec128 {
+    union {
+        float4 f4;
+        hip_bfloat16 bf16[8];
+    };
+};
+
+__device__ __forceinline__ float vec_dot(const Vec128& a, const Vec128& b) {
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sum += static_cast<float>(a.bf16[i]) * static_cast<float>(b.bf16[i]);
+    }
+    return sum;
+}
+
+// --- Main Kernel ---
+template<int HEAD_SIZE, int BLOCK_SIZE>
+__global__ void paged_attn_kernel_opt(
+    hip_bfloat16* __restrict__ output,
+    float* __restrict__ temp_acc,      
+    float* __restrict__ temp_meta,     
+    const hip_bfloat16* __restrict__ q,
+    const hip_bfloat16* __restrict__ k_cache,
+    const hip_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ block_tables,
+    const int64_t* __restrict__ kv_lens,
+    const int64_t* __restrict__ q_lens,
+    const float scale,
+    const int max_num_blocks_per_seq,
+    const int q_stride_0, const int q_stride_1,
+    const int k_stride_block, const int k_stride_token, const int k_stride_head,
+    const int v_stride_block, const int v_stride_token, const int v_stride_head,
+    const int num_kv_heads,
+    const int num_splits
+) {
+    const int q_token_global_idx = blockIdx.x; 
+    const int head_idx = blockIdx.y;
+    const int split_idx = blockIdx.z;
+
+    // --- 1. Metadata ---
+    int local_seq_idx = 0;
+    int current_q_start = 0;
+    int q_len_val = 0;
+    
+    if (gridDim.x > 1) {
+       int limit = gridDim.x; 
+       for(int i=0; i < limit; ++i) {
+           int len = (int)q_lens[i];
+           if (q_token_global_idx < current_q_start + len) {
+               local_seq_idx = i;
+               q_len_val = len;
+               break;
+           }
+           current_q_start += len;
+       }
+    } else {
+       q_len_val = (int)q_lens[0];
+    }
+    
+    const int kv_len = (int)kv_lens[local_seq_idx];
+    const int q_pos_in_seq = q_token_global_idx - current_q_start;
+    const int num_q_heads = gridDim.y;
+    const int group_size = num_q_heads / num_kv_heads; 
+    const int kv_head_idx = head_idx / group_size;
+
+    // --- 2. Split Range ---
+    const int total_logical_blocks = (kv_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int blocks_per_split = (total_logical_blocks + num_splits - 1) / num_splits;
+    const int start_blk = split_idx * blocks_per_split;
+    const int end_blk = min(start_blk + blocks_per_split, total_logical_blocks);
+    
+    if (start_blk >= end_blk) {
+        if (num_splits > 1 && threadIdx.x == 0) {
+            int meta_idx = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * 2;
+            temp_meta[meta_idx] = -1e20f;     
+            temp_meta[meta_idx + 1] = 0.0f;   
+        }
+        return;
+    }
+
+    // --- 3. Load Q ---
+    const int VECS_PER_HEAD = HEAD_SIZE / 8;
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+
+    Vec128 q_vec;
+    #pragma unroll
+    for(int i=0; i<8; ++i) q_vec.bf16[i] = hip_bfloat16(0.0f);
+
+    if (tid < VECS_PER_HEAD) {
+        const float4* q_ptr_f4 = reinterpret_cast<const float4*>(
+            q + q_token_global_idx * q_stride_0 + head_idx * q_stride_1
+        );
+        q_vec.f4 = q_ptr_f4[tid];
+        #pragma unroll
+        for(int i=0; i<8; ++i) {
+             float val = static_cast<float>(q_vec.bf16[i]);
+             q_vec.bf16[i] = hip_bfloat16(val * scale);
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float val = static_cast<float>(q_vec.bf16[i]);
+        val = __shfl(val, lane_id % VECS_PER_HEAD, WARP_SIZE);
+        q_vec.bf16[i] = hip_bfloat16(val);
+    }
+    
+    // --- 4. Main Loop ---
+    float m_i = -1e20f; 
+    float l_i = 0.0f;   
+    float acc[8] = {0.0f};
+
+    constexpr int TOKENS_PER_WARP = WARP_SIZE / VECS_PER_HEAD;
+    const int token_idx_in_group = tid / VECS_PER_HEAD; 
+    const int vec_idx = tid % VECS_PER_HEAD;
+    const int* my_block_table = block_tables + local_seq_idx * max_num_blocks_per_seq;
+    const int causal_limit = kv_len - q_len_val + q_pos_in_seq;
+
+    // === UNIVERSAL FAST PATH (V7) ===
+    // Apply "Safe Loop" logic for ALL head sizes (including 256).
+    // This removes the 'if' check inside the inner loop for 99% of blocks.
+    
+    int loop_end_safe = end_blk;
+    if (end_blk == total_logical_blocks) loop_end_safe = end_blk - 1;
+
+    // A. SAFE LOOP (No Bounds Check)
+    if (start_blk < loop_end_safe) {
+        for (int blk_idx = start_blk; blk_idx < loop_end_safe; ++blk_idx) {
+            const int phys_block = my_block_table[blk_idx];
+            
+            // Unroll Control: H256 needs modest unrolling to avoid register spill, H64/128 can full unroll
+            #pragma unroll (HEAD_SIZE >= 256 ? 4 : 16)
+            for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+                int current_token_off = t + token_idx_in_group;
+                
+                // NO BOUNDS CHECK
+                long long k_offset = (long long)phys_block * k_stride_block + (long long)current_token_off * k_stride_token + (long long)kv_head_idx * k_stride_head;
+                const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+                Vec128 k_vec; k_vec.f4 = k_ptr[vec_idx];
+
+                long long v_offset = (long long)phys_block * v_stride_block + (long long)current_token_off * v_stride_token + (long long)kv_head_idx * v_stride_head;
+                const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+                Vec128 v_vec; v_vec.f4 = v_ptr[vec_idx];
+
+                float score = vec_dot(q_vec, k_vec);
+                #pragma unroll
+                for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) score += __shfl_xor(score, offset, WARP_SIZE);
+                score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+                
+                float m_prev = m_i;
+                m_i = fmaxf(m_i, score);
+                float exp_score = expf(score - m_i);
+                float correction = expf(m_prev - m_i);
+                l_i = l_i * correction + exp_score;
+                #pragma unroll
+                for(int i=0; i<8; ++i) acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+            }
+        }
+    }
+
+    // B. REMAINDER LOOP (With Bounds Check)
+    if (end_blk == total_logical_blocks && start_blk < total_logical_blocks) {
+        int blk_idx = total_logical_blocks - 1;
+        const int phys_block = my_block_table[blk_idx];
+        
+        #pragma unroll (HEAD_SIZE >= 256 ? 4 : 16)
+        for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+            int current_token_off = t + token_idx_in_group;
+            int global_kv_idx = blk_idx * BLOCK_SIZE + current_token_off;
+            
+            bool active = (current_token_off < BLOCK_SIZE) && (global_kv_idx < kv_len) && (global_kv_idx <= causal_limit);
+            if (!active) continue;
+
+            long long k_offset = (long long)phys_block * k_stride_block + (long long)current_token_off * k_stride_token + (long long)kv_head_idx * k_stride_head;
+            const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+            Vec128 k_vec; k_vec.f4 = k_ptr[vec_idx];
+
+            float score = vec_dot(q_vec, k_vec);
+            #pragma unroll
+            for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) score += __shfl_xor(score, offset, WARP_SIZE);
+            score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+            
+            long long v_offset = (long long)phys_block * v_stride_block + (long long)current_token_off * v_stride_token + (long long)kv_head_idx * v_stride_head;
+            const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+            Vec128 v_vec; v_vec.f4 = v_ptr[vec_idx]; 
+            
+            float m_prev = m_i;
+            m_i = fmaxf(m_i, score);
+            float exp_score = expf(score - m_i);
+            float correction = expf(m_prev - m_i);
+            l_i = l_i * correction + exp_score;
+            #pragma unroll
+            for(int i=0; i<8; ++i) acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+        }
+    }
+
+    // --- 5. Reduction ---
+    float global_m = m_i;
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) 
+        global_m = fmaxf(global_m, __shfl_xor(global_m, offset, WARP_SIZE));
+    
+    float correction_factor = expf(m_i - global_m);
+    float l_corrected = l_i * correction_factor;
+    float global_sum_l = l_corrected;
+    
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) 
+        global_sum_l += __shfl_xor(global_sum_l, offset, WARP_SIZE);
+    
+    #pragma unroll
+    for(int i=0; i<8; ++i) acc[i] *= correction_factor;
+    #pragma unroll
+    for(int i=0; i<8; ++i) {
+        #pragma unroll
+        for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) 
+            acc[i] += __shfl_xor(acc[i], offset, WARP_SIZE);
+    }
+    
+    // --- 6. Output ---
+    if (token_idx_in_group == 0 && vec_idx < VECS_PER_HEAD) {
+        if (num_splits == 1) {
+            float inv_sum = 1.0f / (global_sum_l + 1e-6f);
+            float4* out_ptr = reinterpret_cast<float4*>(output + q_token_global_idx * num_q_heads * HEAD_SIZE + head_idx * HEAD_SIZE);
+            Vec128 out_vec;
+            #pragma unroll
+            for(int i=0; i<8; ++i) out_vec.bf16[i] = hip_bfloat16(acc[i] * inv_sum);
+            out_ptr[vec_idx] = out_vec.f4;
+        } else {
+            if (vec_idx == 0) {
+                 int meta_idx = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * 2;
+                 temp_meta[meta_idx] = global_m;
+                 temp_meta[meta_idx + 1] = global_sum_l;
+            }
+            int acc_offset = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * HEAD_SIZE + vec_idx * 8;
+            #pragma unroll
+            for(int i=0; i<8; ++i) temp_acc[acc_offset + i] = acc[i];
+        }
+    }
+}
+
+// --- Merge Kernel ---
+template<int HEAD_SIZE>
+__global__ void split_merge_kernel(
+    hip_bfloat16* __restrict__ output,
+    const float* __restrict__ temp_acc,
+    const float* __restrict__ temp_meta,
+    int num_splits,
+    int num_q_heads
+) {
+    const int q_idx = blockIdx.x;
+    const int h_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+    
+    if (tid >= HEAD_SIZE) return;
+
+    float g_max = -1e20f;
+    int base_meta = (q_idx * num_q_heads + h_idx) * num_splits;
+    
+    for(int s=0; s<num_splits; ++s) {
+        float m = temp_meta[(base_meta + s) * 2];
+        if (m > -1e19f) g_max = fmaxf(g_max, m);
+    }
+    
+    float g_sum = 0.0f;
+    float final_val = 0.0f;
+    int base_acc = (q_idx * num_q_heads + h_idx) * num_splits * HEAD_SIZE;
+
+    for(int s=0; s<num_splits; ++s) {
+        float m = temp_meta[(base_meta + s) * 2];
+        float sum = temp_meta[(base_meta + s) * 2 + 1];
+        
+        if (m > -1e19f) {
+            float weight = sum * expf(m - g_max);
+            g_sum += weight;
+            float val = temp_acc[base_acc + s * HEAD_SIZE + tid];
+            final_val += val * expf(m - g_max);
+        }
+    }
+    
+    int out_idx = q_idx * num_q_heads * HEAD_SIZE + h_idx * HEAD_SIZE + tid;
+    output[out_idx] = hip_bfloat16(final_val / (g_sum + 1e-6f));
+}
+
+// --- Host Function ---
+Tensor custom_paged_attn(
+    const Tensor& query, const Tensor& key_cache, const Tensor& value_cache,
+    const std::vector<int64_t>& query_lens, const std::vector<int64_t>& kv_lens,
+    Tensor block_tables, double scale, double soft_cap = -1.0
+) {
+    const int total_q = query.size(0);
+    const int num_q_heads = query.size(1);
+    const int head_size = query.size(2);
+    const int num_kv_heads = key_cache.size(2);
+    const int max_blocks_per_seq = block_tables.size(1);
+    
+    hipStream_t stream = at::hip::getCurrentHIPStream().stream();
+    Tensor output = torch::empty(query.sizes(), query.options());
+
+    auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(query.device());
+    Tensor q_lens_gpu = torch::empty({(long)query_lens.size()}, opts_i64);
+    Tensor kv_lens_gpu = torch::empty({(long)kv_lens.size()}, opts_i64);
+    
+    hipMemcpyAsync(q_lens_gpu.data_ptr(), query_lens.data(), query_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+    hipMemcpyAsync(kv_lens_gpu.data_ptr(), kv_lens.data(), kv_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+
+    // V7 Optimized Heuristic: HYPER-SPLITTING
+    // Target higher occupancy even for medium batches.
+    int avg_kv_len = 0;
+    if (kv_lens.size() > 0) avg_kv_len = kv_lens[0]; 
+    
+    int num_splits = 1;
+    int blocks_needed = total_q * num_q_heads;
+    
+    // Hyper-target: 2048 blocks (allows 4x split for BS=8, 8x for BS=1)
+    int target_blocks = 2048; 
+    
+    if (blocks_needed < target_blocks && avg_kv_len > 128) {
+        num_splits = target_blocks / blocks_needed;
+        if (num_splits > 8) num_splits = 8;
+        if (num_splits < 1) num_splits = 1;
+    }
+
+    Tensor temp_acc, temp_meta;
+    if (num_splits > 1) {
+        auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
+        temp_acc = torch::empty({total_q, num_q_heads, num_splits, head_size}, opts_f32);
+        temp_meta = torch::empty({total_q, num_q_heads, num_splits, 2}, opts_f32);
+    } else {
+        temp_acc = torch::empty({0}, query.options());
+        temp_meta = torch::empty({0}, query.options());
+    }
+
+    dim3 grid(total_q, num_q_heads, num_splits);
+    dim3 block(WARP_SIZE);
+    
+    #define LAUNCH_KERNEL(HEAD_SIZE) \
+        paged_attn_kernel_opt<HEAD_SIZE, 16><<<grid, block, 0, stream>>>( \
+            (hip_bfloat16*)output.data_ptr(), \
+            num_splits > 1 ? temp_acc.data_ptr<float>() : nullptr, \
+            num_splits > 1 ? temp_meta.data_ptr<float>() : nullptr, \
+            (hip_bfloat16*)query.data_ptr(), \
+            (hip_bfloat16*)key_cache.data_ptr(), \
+            (hip_bfloat16*)value_cache.data_ptr(), \
+            block_tables.data_ptr<int>(), \
+            kv_lens_gpu.data_ptr<int64_t>(), \
+            q_lens_gpu.data_ptr<int64_t>(), \
+            (float)scale, \
+            max_blocks_per_seq, \
+            query.stride(0), query.stride(1), \
+            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), \
+            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), \
+            num_kv_heads, \
+            num_splits \
+        ); \
+        if (num_splits > 1) { \
+            dim3 merge_grid(total_q, num_q_heads); \
+            dim3 merge_block(HEAD_SIZE); \
+            split_merge_kernel<HEAD_SIZE><<<merge_grid, merge_block, 0, stream>>>( \
+                (hip_bfloat16*)output.data_ptr(), \
+                temp_acc.data_ptr<float>(), \
+                temp_meta.data_ptr<float>(), \
+                num_splits, \
+                num_q_heads \
+            ); \
+        }
+
+    switch (head_size) {
+        case 64: LAUNCH_KERNEL(64); break;
+        case 128: LAUNCH_KERNEL(128); break;
+        case 256: LAUNCH_KERNEL(256); break;
+    }
+
+    return output;
+}
+
+PYBIND11_MODULE(custom_attn, m) {
+    m.def("custom_paged_attn", &custom_paged_attn, "Optimized Paged Attention V7 (Universal FastPath)");
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#include <torch/torch.h>
+#include <ATen/hip/HIPContext.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
+#include <vector>
+#include <cmath>
+
+using torch::Tensor;
+
+#define WARP_SIZE 64
+#define WARPS_PER_BLOCK 4 // V9: Group 4 warps per block
+
+struct alignas(16) Vec128 {
+    union {
+        float4 f4;
+        hip_bfloat16 bf16[8];
+    };
+};
+
+__device__ __forceinline__ float vec_dot(const Vec128& a, const Vec128& b) {
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sum += static_cast<float>(a.bf16[i]) * static_cast<float>(b.bf16[i]);
+    }
+    return sum;
+}
+
+// --- Main Kernel ---
+template<int HEAD_SIZE, int BLOCK_SIZE>
+__global__ void paged_attn_kernel_opt(
+    hip_bfloat16* __restrict__ output,
+    hip_bfloat16* __restrict__ temp_acc, 
+    float* __restrict__ temp_meta,     
+    const hip_bfloat16* __restrict__ q,
+    const hip_bfloat16* __restrict__ k_cache,
+    const hip_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ block_tables,
+    const int64_t* __restrict__ kv_lens,
+    const int64_t* __restrict__ q_lens,
+    const float scale,
+    const int max_num_blocks_per_seq,
+    const int q_stride_0, const int q_stride_1,
+    const int k_stride_block, const int k_stride_token, const int k_stride_head,
+    const int v_stride_block, const int v_stride_token, const int v_stride_head,
+    const int num_kv_heads,
+    const int num_splits,
+    const int num_q_heads_real // Passed explicitly
+) {
+    const int q_token_global_idx = blockIdx.x; 
+    
+    // V9 Change: Calculate Head Index based on Warp ID within Block
+    // blockIdx.y handles a chunk of WARPS_PER_BLOCK heads
+    // threadIdx.y is the warp index within the block (0..3)
+    const int head_idx = blockIdx.y * WARPS_PER_BLOCK + threadIdx.y;
+    
+    // Boundary check
+    if (head_idx >= num_q_heads_real) return;
+
+    const int split_idx = blockIdx.z;
+
+    // --- 1. Metadata ---
+    int local_seq_idx = 0;
+    int current_q_start = 0;
+    int q_len_val = 0;
+    
+    if (gridDim.x > 1) {
+       int limit = gridDim.x; 
+       for(int i=0; i < limit; ++i) {
+           int len = (int)q_lens[i];
+           if (q_token_global_idx < current_q_start + len) {
+               local_seq_idx = i;
+               q_len_val = len;
+               break;
+           }
+           current_q_start += len;
+       }
+    } else {
+       q_len_val = (int)q_lens[0];
+    }
+    
+    const int kv_len = (int)kv_lens[local_seq_idx];
+    const int q_pos_in_seq = q_token_global_idx - current_q_start;
+    const int num_q_heads = num_q_heads_real;
+    const int group_size = num_q_heads / num_kv_heads; 
+    const int kv_head_idx = head_idx / group_size;
+
+    // --- 2. Split Range ---
+    const int total_logical_blocks = (kv_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int blocks_per_split = (total_logical_blocks + num_splits - 1) / num_splits;
+    const int start_blk = split_idx * blocks_per_split;
+    const int end_blk = min(start_blk + blocks_per_split, total_logical_blocks);
+    
+    if (start_blk >= end_blk) {
+        if (num_splits > 1 && threadIdx.x == 0) {
+            int meta_idx = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * 2;
+            temp_meta[meta_idx] = -1e20f;     
+            temp_meta[meta_idx + 1] = 0.0f;   
+        }
+        return;
+    }
+
+    // --- 3. Load Q ---
+    const int VECS_PER_HEAD = HEAD_SIZE / 8;
+    const int tid = threadIdx.x; // Lane ID (0..63)
+    const int lane_id = tid % WARP_SIZE;
+
+    Vec128 q_vec;
+    #pragma unroll
+    for(int i=0; i<8; ++i) q_vec.bf16[i] = hip_bfloat16(0.0f);
+
+    if (tid < VECS_PER_HEAD) {
+        const float4* q_ptr_f4 = reinterpret_cast<const float4*>(
+            q + q_token_global_idx * q_stride_0 + head_idx * q_stride_1
+        );
+        q_vec.f4 = q_ptr_f4[tid];
+        #pragma unroll
+        for(int i=0; i<8; ++i) {
+             float val = static_cast<float>(q_vec.bf16[i]);
+             q_vec.bf16[i] = hip_bfloat16(val * scale);
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float val = static_cast<float>(q_vec.bf16[i]);
+        val = __shfl(val, lane_id % VECS_PER_HEAD, WARP_SIZE);
+        q_vec.bf16[i] = hip_bfloat16(val);
+    }
+    
+    // --- 4. Main Loop (V7 FastPath) ---
+    float m_i = -1e20f; 
+    float l_i = 0.0f;   
+    float acc[8] = {0.0f};
+
+    constexpr int TOKENS_PER_WARP = WARP_SIZE / VECS_PER_HEAD;
+    const int token_idx_in_group = tid / VECS_PER_HEAD; 
+    const int vec_idx = tid % VECS_PER_HEAD;
+    const int* my_block_table = block_tables + local_seq_idx * max_num_blocks_per_seq;
+    const int causal_limit = kv_len - q_len_val + q_pos_in_seq;
+    
+    int loop_end_safe = end_blk;
+    if (end_blk == total_logical_blocks) loop_end_safe = end_blk - 1;
+
+    // A. SAFE LOOP
+    if (start_blk < loop_end_safe) {
+        for (int blk_idx = start_blk; blk_idx < loop_end_safe; ++blk_idx) {
+            const int phys_block = my_block_table[blk_idx];
+            #pragma unroll (HEAD_SIZE >= 256 ? 4 : 16)
+            for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+                int current_token_off = t + token_idx_in_group;
+                long long k_offset = (long long)phys_block * k_stride_block + (long long)current_token_off * k_stride_token + (long long)kv_head_idx * k_stride_head;
+                const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+                Vec128 k_vec; k_vec.f4 = k_ptr[vec_idx];
+
+                long long v_offset = (long long)phys_block * v_stride_block + (long long)current_token_off * v_stride_token + (long long)kv_head_idx * v_stride_head;
+                const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+                Vec128 v_vec; v_vec.f4 = v_ptr[vec_idx];
+
+                float score = vec_dot(q_vec, k_vec);
+                #pragma unroll
+                for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) score += __shfl_xor(score, offset, WARP_SIZE);
+                score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+                
+                float m_prev = m_i;
+                m_i = fmaxf(m_i, score);
+                float exp_score = expf(score - m_i);
+                float correction = expf(m_prev - m_i);
+                l_i = l_i * correction + exp_score;
+                #pragma unroll
+                for(int i=0; i<8; ++i) acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+            }
+        }
+    }
+
+    // B. REMAINDER LOOP
+    if (end_blk == total_logical_blocks && start_blk < total_logical_blocks) {
+        int blk_idx = total_logical_blocks - 1;
+        const int phys_block = my_block_table[blk_idx];
+        #pragma unroll (HEAD_SIZE >= 256 ? 4 : 16)
+        for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+            int current_token_off = t + token_idx_in_group;
+            int global_kv_idx = blk_idx * BLOCK_SIZE + current_token_off;
+            if (!((current_token_off < BLOCK_SIZE) && (global_kv_idx < kv_len) && (global_kv_idx <= causal_limit))) continue;
+
+            long long k_offset = (long long)phys_block * k_stride_block + (long long)current_token_off * k_stride_token + (long long)kv_head_idx * k_stride_head;
+            const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+            Vec128 k_vec; k_vec.f4 = k_ptr[vec_idx];
+
+            float score = vec_dot(q_vec, k_vec);
+            #pragma unroll
+            for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) score += __shfl_xor(score, offset, WARP_SIZE);
+            score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+            
+            long long v_offset = (long long)phys_block * v_stride_block + (long long)current_token_off * v_stride_token + (long long)kv_head_idx * v_stride_head;
+            const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+            Vec128 v_vec; v_vec.f4 = v_ptr[vec_idx]; 
+            
+            float m_prev = m_i;
+            m_i = fmaxf(m_i, score);
+            float exp_score = expf(score - m_i);
+            float correction = expf(m_prev - m_i);
+            l_i = l_i * correction + exp_score;
+            #pragma unroll
+            for(int i=0; i<8; ++i) acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+        }
+    }
+
+    // --- 5. Reduction ---
+    float global_m = m_i;
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) 
+        global_m = fmaxf(global_m, __shfl_xor(global_m, offset, WARP_SIZE));
+    
+    float correction_factor = expf(m_i - global_m);
+    float l_corrected = l_i * correction_factor;
+    float global_sum_l = l_corrected;
+    
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) 
+        global_sum_l += __shfl_xor(global_sum_l, offset, WARP_SIZE);
+    
+    #pragma unroll
+    for(int i=0; i<8; ++i) acc[i] *= correction_factor;
+    #pragma unroll
+    for(int i=0; i<8; ++i) {
+        #pragma unroll
+        for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) 
+            acc[i] += __shfl_xor(acc[i], offset, WARP_SIZE);
+    }
+    
+    // --- 6. Output ---
+    if (token_idx_in_group == 0 && vec_idx < VECS_PER_HEAD) {
+        if (num_splits == 1) {
+            float inv_sum = 1.0f / (global_sum_l + 1e-6f);
+            float4* out_ptr = reinterpret_cast<float4*>(output + q_token_global_idx * num_q_heads * HEAD_SIZE + head_idx * HEAD_SIZE);
+            Vec128 out_vec;
+            #pragma unroll
+            for(int i=0; i<8; ++i) out_vec.bf16[i] = hip_bfloat16(acc[i] * inv_sum);
+            out_ptr[vec_idx] = out_vec.f4;
+        } else {
+            if (vec_idx == 0) {
+                 int meta_idx = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * 2;
+                 temp_meta[meta_idx] = global_m;
+                 temp_meta[meta_idx + 1] = global_sum_l;
+            }
+            int base_offset = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * HEAD_SIZE;
+            Vec128 tmp_store;
+            #pragma unroll
+            for(int i=0; i<8; ++i) tmp_store.bf16[i] = hip_bfloat16(acc[i]); 
+            float4* temp_ptr_f4 = reinterpret_cast<float4*>(temp_acc + base_offset);
+            temp_ptr_f4[vec_idx] = tmp_store.f4;
+        }
+    }
+}
+
+// --- Merge Kernel ---
+template<int HEAD_SIZE>
+__global__ void split_merge_kernel(
+    hip_bfloat16* __restrict__ output,
+    const hip_bfloat16* __restrict__ temp_acc, 
+    const float* __restrict__ temp_meta,
+    int num_splits,
+    int num_q_heads
+) {
+    const int q_idx = blockIdx.x;
+    const int h_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+    
+    if (tid >= HEAD_SIZE) return;
+
+    float g_max = -1e20f;
+    int base_meta = (q_idx * num_q_heads + h_idx) * num_splits;
+    
+    for(int s=0; s<num_splits; ++s) {
+        float m = temp_meta[(base_meta + s) * 2];
+        if (m > -1e19f) g_max = fmaxf(g_max, m);
+    }
+    
+    float g_sum = 0.0f;
+    float final_val = 0.0f;
+    int base_acc = (q_idx * num_q_heads + h_idx) * num_splits * HEAD_SIZE;
+
+    for(int s=0; s<num_splits; ++s) {
+        float m = temp_meta[(base_meta + s) * 2];
+        float sum = temp_meta[(base_meta + s) * 2 + 1];
+        
+        if (m > -1e19f) {
+            float weight = sum * expf(m - g_max);
+            g_sum += weight;
+            float val = static_cast<float>(temp_acc[base_acc + s * HEAD_SIZE + tid]);
+            final_val += val * expf(m - g_max);
+        }
+    }
+    
+    int out_idx = q_idx * num_q_heads * HEAD_SIZE + h_idx * HEAD_SIZE + tid;
+    output[out_idx] = hip_bfloat16(final_val / (g_sum + 1e-6f));
+}
+
+// --- Host Function ---
+Tensor custom_paged_attn(
+    const Tensor& query, const Tensor& key_cache, const Tensor& value_cache,
+    const std::vector<int64_t>& query_lens, const std::vector<int64_t>& kv_lens,
+    Tensor block_tables, double scale, double soft_cap = -1.0
+) {
+    const int total_q = query.size(0);
+    const int num_q_heads = query.size(1);
+    const int head_size = query.size(2);
+    const int num_kv_heads = key_cache.size(2);
+    const int max_blocks_per_seq = block_tables.size(1);
+    
+    hipStream_t stream = at::hip::getCurrentHIPStream().stream();
+    Tensor output = torch::empty(query.sizes(), query.options());
+
+    auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(query.device());
+    Tensor q_lens_gpu = torch::empty({(long)query_lens.size()}, opts_i64);
+    Tensor kv_lens_gpu = torch::empty({(long)kv_lens.size()}, opts_i64);
+    
+    hipMemcpyAsync(q_lens_gpu.data_ptr(), query_lens.data(), query_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+    hipMemcpyAsync(kv_lens_gpu.data_ptr(), kv_lens.data(), kv_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+
+    // Heuristic (Preserved from V8)
+    int avg_kv_len = 0;
+    if (kv_lens.size() > 0) avg_kv_len = kv_lens[0]; 
+    
+    int num_splits = 1;
+    int blocks_needed = total_q * num_q_heads;
+    int target_blocks = 2560; 
+    
+    if (blocks_needed < target_blocks && avg_kv_len > 128) {
+        num_splits = target_blocks / blocks_needed;
+        if (num_splits > 8) num_splits = 8;
+        if (num_splits < 1) num_splits = 1;
+    }
+
+    Tensor temp_acc, temp_meta;
+    if (num_splits > 1) {
+        auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
+        auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(query.device());
+        temp_acc = torch::empty({total_q, num_q_heads, num_splits, head_size}, opts_bf16);
+        temp_meta = torch::empty({total_q, num_q_heads, num_splits, 2}, opts_f32);
+    } else {
+        temp_acc = torch::empty({0}, query.options());
+        temp_meta = torch::empty({0}, query.options());
+    }
+
+    // V9 Grid Setup: Reduce Grid Y by WARPS_PER_BLOCK
+    int grid_y = (num_q_heads + WARPS_PER_BLOCK - 1) / WARPS_PER_BLOCK;
+    dim3 grid(total_q, grid_y, num_splits);
+    
+    // V9 Block Setup: Use multiple warps in Y dimension
+    dim3 block(WARP_SIZE, WARPS_PER_BLOCK);
+    
+    #define LAUNCH_KERNEL(HEAD_SIZE) \
+        paged_attn_kernel_opt<HEAD_SIZE, 16><<<grid, block, 0, stream>>>( \
+            (hip_bfloat16*)output.data_ptr(), \
+            num_splits > 1 ? (hip_bfloat16*)temp_acc.data_ptr() : nullptr, \
+            num_splits > 1 ? temp_meta.data_ptr<float>() : nullptr, \
+            (hip_bfloat16*)query.data_ptr(), \
+            (hip_bfloat16*)key_cache.data_ptr(), \
+            (hip_bfloat16*)value_cache.data_ptr(), \
+            block_tables.data_ptr<int>(), \
+            kv_lens_gpu.data_ptr<int64_t>(), \
+            q_lens_gpu.data_ptr<int64_t>(), \
+            (float)scale, \
+            max_blocks_per_seq, \
+            query.stride(0), query.stride(1), \
+            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), \
+            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), \
+            num_kv_heads, \
+            num_splits, \
+            num_q_heads \
+        ); \
+        if (num_splits > 1) { \
+            dim3 merge_grid(total_q, num_q_heads); \
+            dim3 merge_block(HEAD_SIZE); \
+            split_merge_kernel<HEAD_SIZE><<<merge_grid, merge_block, 0, stream>>>( \
+                (hip_bfloat16*)output.data_ptr(), \
+                (hip_bfloat16*)temp_acc.data_ptr(), \
+                temp_meta.data_ptr<float>(), \
+                num_splits, \
+                num_q_heads \
+            ); \
+        }
+
+    switch (head_size) {
+        case 64: LAUNCH_KERNEL(64); break;
+        case 128: LAUNCH_KERNEL(128); break;
+        case 256: LAUNCH_KERNEL(256); break;
+    }
+
+    return output;
+}
+
+PYBIND11_MODULE(custom_attn, m) {
+    m.def("custom_paged_attn", &custom_paged_attn, "Optimized Paged Attention V9 (Multi-Warp Block)");
+}
+
+
+
+
+#include <torch/torch.h>
+#include <ATen/hip/HIPContext.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_bfloat16.h>
+#include <vector>
+#include <cmath>
+
+using torch::Tensor;
+
+#define WARP_SIZE 64
+
+struct alignas(16) Vec128 {
+    union {
+        float4 f4;
+        hip_bfloat16 bf16[8];
+    };
+};
+
+__device__ __forceinline__ float vec_dot(const Vec128& a, const Vec128& b) {
+    float sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        sum += static_cast<float>(a.bf16[i]) * static_cast<float>(b.bf16[i]);
+    }
+    return sum;
+}
+
+// --- Main Kernel (Templated Warps) ---
+// Added NUM_WARPS as a template parameter so compiler can optimize constants
+template<int HEAD_SIZE, int BLOCK_SIZE, int NUM_WARPS>
+__global__ void paged_attn_kernel_opt(
+    hip_bfloat16* __restrict__ output,
+    hip_bfloat16* __restrict__ temp_acc, 
+    float* __restrict__ temp_meta,     
+    const hip_bfloat16* __restrict__ q,
+    const hip_bfloat16* __restrict__ k_cache,
+    const hip_bfloat16* __restrict__ v_cache,
+    const int* __restrict__ block_tables,
+    const int64_t* __restrict__ kv_lens,
+    const int64_t* __restrict__ q_lens,
+    const float scale,
+    const int max_num_blocks_per_seq,
+    const int q_stride_0, const int q_stride_1,
+    const int k_stride_block, const int k_stride_token, const int k_stride_head,
+    const int v_stride_block, const int v_stride_token, const int v_stride_head,
+    const int num_kv_heads,
+    const int num_splits,
+    const int num_q_heads_real
+) {
+    const int q_token_global_idx = blockIdx.x; 
+    
+    // Compile-time constant indexing
+    const int head_idx = blockIdx.y * NUM_WARPS + threadIdx.y;
+    
+    if (head_idx >= num_q_heads_real) return;
+
+    const int split_idx = blockIdx.z;
+
+    // --- 1. Metadata ---
+    int local_seq_idx = 0;
+    int current_q_start = 0;
+    int q_len_val = 0;
+    
+    // Fast Scan
+    if (gridDim.x > 1) {
+       int limit = gridDim.x; 
+       for(int i=0; i < limit; ++i) {
+           int len = (int)q_lens[i];
+           if (q_token_global_idx < current_q_start + len) {
+               local_seq_idx = i;
+               q_len_val = len;
+               break;
+           }
+           current_q_start += len;
+       }
+    } else {
+       q_len_val = (int)q_lens[0];
+    }
+    
+    const int kv_len = (int)kv_lens[local_seq_idx];
+    const int q_pos_in_seq = q_token_global_idx - current_q_start;
+    const int num_q_heads = num_q_heads_real;
+    const int group_size = num_q_heads / num_kv_heads; 
+    const int kv_head_idx = head_idx / group_size;
+
+    // --- 2. Split Range ---
+    const int total_logical_blocks = (kv_len + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int blocks_per_split = (total_logical_blocks + num_splits - 1) / num_splits;
+    const int start_blk = split_idx * blocks_per_split;
+    const int end_blk = min(start_blk + blocks_per_split, total_logical_blocks);
+    
+    if (start_blk >= end_blk) {
+        if (num_splits > 1 && threadIdx.x == 0 && threadIdx.y == 0) {
+            int meta_idx = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * 2;
+            temp_meta[meta_idx] = -1e20f;     
+            temp_meta[meta_idx + 1] = 0.0f;   
+        }
+        return;
+    }
+
+    // --- 3. Load Q ---
+    const int VECS_PER_HEAD = HEAD_SIZE / 8;
+    const int tid = threadIdx.x;
+    const int lane_id = tid % WARP_SIZE;
+
+    Vec128 q_vec;
+    #pragma unroll
+    for(int i=0; i<8; ++i) q_vec.bf16[i] = hip_bfloat16(0.0f);
+
+    if (tid < VECS_PER_HEAD) {
+        const float4* q_ptr_f4 = reinterpret_cast<const float4*>(
+            q + q_token_global_idx * q_stride_0 + head_idx * q_stride_1
+        );
+        q_vec.f4 = q_ptr_f4[tid];
+        #pragma unroll
+        for(int i=0; i<8; ++i) {
+             float val = static_cast<float>(q_vec.bf16[i]);
+             q_vec.bf16[i] = hip_bfloat16(val * scale);
+        }
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        float val = static_cast<float>(q_vec.bf16[i]);
+        val = __shfl(val, lane_id % VECS_PER_HEAD, WARP_SIZE);
+        q_vec.bf16[i] = hip_bfloat16(val);
+    }
+    
+    // --- 4. Main Loop ---
+    float m_i = -1e20f; 
+    float l_i = 0.0f;   
+    float acc[8] = {0.0f};
+
+    constexpr int TOKENS_PER_WARP = WARP_SIZE / VECS_PER_HEAD;
+    const int token_idx_in_group = tid / VECS_PER_HEAD; 
+    const int vec_idx = tid % VECS_PER_HEAD;
+    const int* my_block_table = block_tables + local_seq_idx * max_num_blocks_per_seq;
+    const int causal_limit = kv_len - q_len_val + q_pos_in_seq;
+    
+    int loop_end_safe = end_blk;
+    if (end_blk == total_logical_blocks) loop_end_safe = end_blk - 1;
+
+    const long long k_head_offset = (long long)kv_head_idx * k_stride_head;
+    const long long v_head_offset = (long long)kv_head_idx * v_stride_head;
+
+    // A. SAFE LOOP
+    if (start_blk < loop_end_safe) {
+        for (int blk_idx = start_blk; blk_idx < loop_end_safe; ++blk_idx) {
+            const int phys_block = my_block_table[blk_idx];
+            
+            #pragma unroll (HEAD_SIZE >= 256 ? 4 : 16)
+            for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+                int current_token_off = t + token_idx_in_group;
+                long long k_offset = k_head_offset + (long long)phys_block * k_stride_block + (long long)current_token_off * k_stride_token;
+                const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+                Vec128 k_vec; k_vec.f4 = k_ptr[vec_idx];
+
+                long long v_offset = v_head_offset + (long long)phys_block * v_stride_block + (long long)current_token_off * v_stride_token;
+                const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+                Vec128 v_vec; v_vec.f4 = v_ptr[vec_idx];
+
+                float score = vec_dot(q_vec, k_vec);
+                #pragma unroll
+                for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) score += __shfl_xor(score, offset, WARP_SIZE);
+                score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+                
+                float m_prev = m_i;
+                m_i = fmaxf(m_i, score);
+                float exp_score = expf(score - m_i);
+                float correction = expf(m_prev - m_i);
+                l_i = l_i * correction + exp_score;
+                #pragma unroll
+                for(int i=0; i<8; ++i) acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+            }
+        }
+    }
+
+    // B. REMAINDER LOOP
+    if (end_blk == total_logical_blocks && start_blk < total_logical_blocks) {
+        int blk_idx = total_logical_blocks - 1;
+        const int phys_block = my_block_table[blk_idx];
+        #pragma unroll (HEAD_SIZE >= 256 ? 4 : 16)
+        for (int t = 0; t < BLOCK_SIZE; t += TOKENS_PER_WARP) {
+            int current_token_off = t + token_idx_in_group;
+            int global_kv_idx = blk_idx * BLOCK_SIZE + current_token_off;
+            if (!((current_token_off < BLOCK_SIZE) && (global_kv_idx < kv_len) && (global_kv_idx <= causal_limit))) continue;
+
+            long long k_offset = k_head_offset + (long long)phys_block * k_stride_block + (long long)current_token_off * k_stride_token;
+            const float4* k_ptr = reinterpret_cast<const float4*>(k_cache + k_offset);
+            Vec128 k_vec; k_vec.f4 = k_ptr[vec_idx];
+
+            float score = vec_dot(q_vec, k_vec);
+            #pragma unroll
+            for (int offset = VECS_PER_HEAD / 2; offset > 0; offset /= 2) score += __shfl_xor(score, offset, WARP_SIZE);
+            score = __shfl(score, (tid / VECS_PER_HEAD) * VECS_PER_HEAD, WARP_SIZE); 
+            
+            long long v_offset = v_head_offset + (long long)phys_block * v_stride_block + (long long)current_token_off * v_stride_token;
+            const float4* v_ptr = reinterpret_cast<const float4*>(v_cache + v_offset);
+            Vec128 v_vec; v_vec.f4 = v_ptr[vec_idx]; 
+            
+            float m_prev = m_i;
+            m_i = fmaxf(m_i, score);
+            float exp_score = expf(score - m_i);
+            float correction = expf(m_prev - m_i);
+            l_i = l_i * correction + exp_score;
+            #pragma unroll
+            for(int i=0; i<8; ++i) acc[i] = acc[i] * correction + static_cast<float>(v_vec.bf16[i]) * exp_score;
+        }
+    }
+
+    // --- 5. Reduction ---
+    float global_m = m_i;
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) global_m = fmaxf(global_m, __shfl_xor(global_m, offset, WARP_SIZE));
+    float correction_factor = expf(m_i - global_m);
+    float l_corrected = l_i * correction_factor;
+    float global_sum_l = l_corrected;
+    #pragma unroll
+    for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) global_sum_l += __shfl_xor(global_sum_l, offset, WARP_SIZE);
+    #pragma unroll
+    for(int i=0; i<8; ++i) acc[i] *= correction_factor;
+    #pragma unroll
+    for(int i=0; i<8; ++i) {
+        #pragma unroll
+        for (int offset = VECS_PER_HEAD; offset < WARP_SIZE; offset *= 2) acc[i] += __shfl_xor(acc[i], offset, WARP_SIZE);
+    }
+    
+    // --- 6. Output ---
+    if (token_idx_in_group == 0 && vec_idx < VECS_PER_HEAD) {
+        if (num_splits == 1) {
+            float inv_sum = 1.0f / (global_sum_l + 1e-6f);
+            float4* out_ptr = reinterpret_cast<float4*>(output + q_token_global_idx * num_q_heads * HEAD_SIZE + head_idx * HEAD_SIZE);
+            Vec128 out_vec;
+            #pragma unroll
+            for(int i=0; i<8; ++i) out_vec.bf16[i] = hip_bfloat16(acc[i] * inv_sum);
+            out_ptr[vec_idx] = out_vec.f4;
+        } else {
+            if (vec_idx == 0) {
+                 int meta_idx = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * 2;
+                 temp_meta[meta_idx] = global_m;
+                 temp_meta[meta_idx + 1] = global_sum_l;
+            }
+            int base_offset = (q_token_global_idx * num_q_heads * num_splits + head_idx * num_splits + split_idx) * HEAD_SIZE;
+            Vec128 tmp_store;
+            #pragma unroll
+            for(int i=0; i<8; ++i) tmp_store.bf16[i] = hip_bfloat16(acc[i]); 
+            float4* temp_ptr_f4 = reinterpret_cast<float4*>(temp_acc + base_offset);
+            temp_ptr_f4[vec_idx] = tmp_store.f4;
+        }
+    }
+}
+
+// --- Merge Kernel ---
+template<int HEAD_SIZE>
+__global__ void split_merge_kernel(
+    hip_bfloat16* __restrict__ output,
+    const hip_bfloat16* __restrict__ temp_acc, 
+    const float* __restrict__ temp_meta,
+    int num_splits,
+    int num_q_heads
+) {
+    const int q_idx = blockIdx.x;
+    const int h_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (tid >= HEAD_SIZE) return;
+
+    float g_max = -1e20f;
+    int base_meta = (q_idx * num_q_heads + h_idx) * num_splits;
+    for(int s=0; s<num_splits; ++s) {
+        float m = temp_meta[(base_meta + s) * 2];
+        if (m > -1e19f) g_max = fmaxf(g_max, m);
+    }
+    
+    float g_sum = 0.0f;
+    float final_val = 0.0f;
+    int base_acc = (q_idx * num_q_heads + h_idx) * num_splits * HEAD_SIZE;
+
+    for(int s=0; s<num_splits; ++s) {
+        float m = temp_meta[(base_meta + s) * 2];
+        float sum = temp_meta[(base_meta + s) * 2 + 1];
+        if (m > -1e19f) {
+            float weight = sum * expf(m - g_max);
+            g_sum += weight;
+            float val = static_cast<float>(temp_acc[base_acc + s * HEAD_SIZE + tid]);
+            final_val += val * expf(m - g_max);
+        }
+    }
+    
+    int out_idx = q_idx * num_q_heads * HEAD_SIZE + h_idx * HEAD_SIZE + tid;
+    output[out_idx] = hip_bfloat16(final_val / (g_sum + 1e-6f));
+}
+
+// --- Host Function ---
+Tensor custom_paged_attn(
+    const Tensor& query, const Tensor& key_cache, const Tensor& value_cache,
+    const std::vector<int64_t>& query_lens, const std::vector<int64_t>& kv_lens,
+    Tensor block_tables, double scale, double soft_cap = -1.0
+) {
+    const int total_q = query.size(0);
+    const int num_q_heads = query.size(1);
+    const int head_size = query.size(2);
+    const int num_kv_heads = key_cache.size(2);
+    const int max_blocks_per_seq = block_tables.size(1);
+    
+    hipStream_t stream = at::hip::getCurrentHIPStream().stream();
+    Tensor output = torch::empty(query.sizes(), query.options());
+
+    auto opts_i64 = torch::TensorOptions().dtype(torch::kInt64).device(query.device());
+    Tensor q_lens_gpu = torch::empty({(long)query_lens.size()}, opts_i64);
+    Tensor kv_lens_gpu = torch::empty({(long)kv_lens.size()}, opts_i64);
+    
+    hipMemcpyAsync(q_lens_gpu.data_ptr(), query_lens.data(), query_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+    hipMemcpyAsync(kv_lens_gpu.data_ptr(), kv_lens.data(), kv_lens.size() * sizeof(int64_t), hipMemcpyHostToDevice, stream);
+
+    // ===============================================
+    // V16 Strategy: Template Specialization Decision
+    // ===============================================
+    
+    // Heuristic 1: Choose Number of Warps per Block
+    // If we have few query tokens (BS < 8), we need max occupancy -> 1 Warp/Block.
+    // If we have many query tokens (BS >= 8), we need latency hiding -> 4 Warps/Block.
+    bool use_multi_warp = (total_q >= 8);
+    int warps_per_block = use_multi_warp ? 4 : 1;
+
+    // Heuristic 2: Choose Number of Splits
+    int avg_kv_len = 0;
+    if (kv_lens.size() > 0) avg_kv_len = kv_lens[0]; 
+    
+    int num_splits = 1;
+    // Note: If using multi-warp, effective blocks = total_q * num_q_heads / 4
+    int blocks_existing = (total_q * num_q_heads + warps_per_block - 1) / warps_per_block;
+    
+    // Target blocks depends on strategy
+    // If 1-Warp: Target 2048+ to fill GPU with many small blocks
+    // If 4-Warp: Target 512+ is usually enough (V9 showed this)
+    int target_blocks = use_multi_warp ? 512 : 2048; 
+    
+    if (blocks_existing < target_blocks && avg_kv_len > 128) {
+        num_splits = target_blocks / blocks_existing;
+        int max_splits = (head_size >= 256) ? 16 : 8; 
+        if (num_splits > max_splits) num_splits = max_splits;
+        if (num_splits < 1) num_splits = 1;
+    }
+
+    Tensor temp_acc, temp_meta;
+    if (num_splits > 1) {
+        auto opts_f32 = torch::TensorOptions().dtype(torch::kFloat32).device(query.device());
+        auto opts_bf16 = torch::TensorOptions().dtype(torch::kBFloat16).device(query.device());
+        temp_acc = torch::empty({total_q, num_q_heads, num_splits, head_size}, opts_bf16);
+        temp_meta = torch::empty({total_q, num_q_heads, num_splits, 2}, opts_f32);
+    } else {
+        temp_acc = torch::empty({0}, query.options());
+        temp_meta = torch::empty({0}, query.options());
+    }
+
+    int grid_y = (num_q_heads + warps_per_block - 1) / warps_per_block;
+    dim3 grid(total_q, grid_y, num_splits);
+    dim3 block(WARP_SIZE, warps_per_block);
+    
+    // MACRO to launch specific template instance
+    #define LAUNCH_INSTANTIATED_KERNEL(H_SIZE, W_COUNT) \
+        paged_attn_kernel_opt<H_SIZE, 16, W_COUNT><<<grid, block, 0, stream>>>( \
+            (hip_bfloat16*)output.data_ptr(), \
+            num_splits > 1 ? (hip_bfloat16*)temp_acc.data_ptr() : nullptr, \
+            num_splits > 1 ? temp_meta.data_ptr<float>() : nullptr, \
+            (hip_bfloat16*)query.data_ptr(), \
+            (hip_bfloat16*)key_cache.data_ptr(), \
+            (hip_bfloat16*)value_cache.data_ptr(), \
+            block_tables.data_ptr<int>(), \
+            kv_lens_gpu.data_ptr<int64_t>(), \
+            q_lens_gpu.data_ptr<int64_t>(), \
+            (float)scale, \
+            max_blocks_per_seq, \
+            query.stride(0), query.stride(1), \
+            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), \
+            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), \
+            num_kv_heads, \
+            num_splits, \
+            num_q_heads \
+        )
+
+    #define DISPATCH_HEAD(H_SIZE) \
+        if (use_multi_warp) { \
+            LAUNCH_INSTANTIATED_KERNEL(H_SIZE, 4); \
+        } else { \
+            LAUNCH_INSTANTIATED_KERNEL(H_SIZE, 1); \
+        }
+
+    switch (head_size) {
+        case 64: DISPATCH_HEAD(64); break;
+        case 128: DISPATCH_HEAD(128); break;
+        case 256: DISPATCH_HEAD(256); break;
+    }
+    
+    if (num_splits > 1) {
+        dim3 merge_grid(total_q, num_q_heads);
+        dim3 merge_block(head_size);
+        
+        // Simple merge dispatch
+        if (head_size == 64) split_merge_kernel<64><<<merge_grid, merge_block, 0, stream>>>((hip_bfloat16*)output.data_ptr(), (hip_bfloat16*)temp_acc.data_ptr(), temp_meta.data_ptr<float>(), num_splits, num_q_heads);
+        else if (head_size == 128) split_merge_kernel<128><<<merge_grid, merge_block, 0, stream>>>((hip_bfloat16*)output.data_ptr(), (hip_bfloat16*)temp_acc.data_ptr(), temp_meta.data_ptr<float>(), num_splits, num_q_heads);
+        else if (head_size == 256) split_merge_kernel<256><<<merge_grid, merge_block, 0, stream>>>((hip_bfloat16*)output.data_ptr(), (hip_bfloat16*)temp_acc.data_ptr(), temp_meta.data_ptr<float>(), num_splits, num_q_heads);
+    }
+
+    return output;
+}
+
+PYBIND11_MODULE(custom_attn, m) {
+    m.def("custom_paged_attn", &custom_paged_attn, "Optimized Paged Attention V16 (Template Specialized)");
+}
